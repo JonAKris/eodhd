@@ -14,7 +14,7 @@ CLI examples:
     python ingest.py all AAPL.US
 
     # daily refresh of EOD prices for everything in the symbols table
-    python ingest.py eod-refresh --since 2024-01-01
+    python ingest.py eod-refresh --since 2026-01-01
 
     # one-shot news pull
     python ingest.py news AAPL.US MSFT.US NVDA.US
