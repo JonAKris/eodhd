@@ -1,4 +1,3 @@
-
 """
 app.py
 ------
@@ -532,8 +531,18 @@ def render_chart(ticker: str, days: int, chart_type: str, overlays: list[str]):
                           row=1, col=1)
 
         if has_vol:
+            # Green when the close rose vs the previous day, red when it fell.
+            # The first bar has no prior day to compare against, so it's neutral.
+            close_change = df["close"].diff()
+            up = "rgba(38,166,154,0.6)"     # green
+            down = "rgba(239,83,80,0.6)"    # red
+            neutral = "rgba(120,120,120,0.5)"
+            vol_colors = [
+                neutral if pd.isna(c) else (up if c >= 0 else down)
+                for c in close_change
+            ]
             fig.add_trace(go.Bar(x=df["date"], y=df["volume"], name="Volume",
-                                 marker=dict(color="rgba(120,120,120,0.5)")),
+                                 marker=dict(color=vol_colors)),
                           row=2, col=1)
 
         fig.update_layout(
