@@ -14,7 +14,7 @@ CLI examples:
     python ingest.py all AAPL.US
 
     # daily refresh of EOD prices for everything in the symbols table
-    python ingest.py eod-refresh --since 2026-01-01
+    python ingest.py eod-refresh --since 2024-01-01
 
     # one-shot news pull
     python ingest.py news AAPL.US MSFT.US NVDA.US
@@ -26,9 +26,11 @@ import argparse
 import logging
 import math
 from datetime import date, datetime
+import datetime as dt
 from typing import Any
 
 import pandas as pd
+import requests
 
 try:
     import numpy as np
@@ -342,6 +344,92 @@ class Ingestor:
             (ticker, code, exch),
         )
 
+    # ---- Search / lookup ------------------------------------------------
+    SEARCH_URL = "https://eodhd.com/api/search/{query}"
+
+    def search_symbols(self, query: str, limit: int = 30,
+                       bonds_only: bool = False) -> list[dict]:
+        """Resolve a free-text query (company name or partial symbol) to a list
+        of candidate instruments using EODHD's Search API.
+
+        Returns a list of dicts with normalised keys:
+            ticker (CODE.EXCHANGE), code, exchange, name, type, country,
+            currency, isin, previous_close
+        Ordered by EODHD's own relevance (popularity / market cap / volume).
+        Falls back to an empty list on any network/API error so callers can
+        degrade gracefully.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+        url = self.SEARCH_URL.format(query=query)
+        try:
+            resp = requests.get(
+                url,
+                params={
+                    "api_token": settings.eodhd_api_key,
+                    "fmt": "json",
+                    "limit": limit,
+                    "type": "bond" if bonds_only else "all",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:  # noqa: BLE001 - network/json/HTTP all degrade the same
+            log.warning("search_symbols(%r) failed: %s", query, e)
+            return []
+        if not isinstance(data, list):
+            return []
+
+        out: list[dict] = []
+        for r in data:
+            if not isinstance(r, dict):
+                continue
+            code = r.get("Code")
+            exch = r.get("Exchange")
+            if not code or not exch:
+                continue
+            out.append({
+                "ticker": f"{code}.{exch}",
+                "code": code,
+                "exchange": exch,
+                "name": r.get("Name"),
+                "type": r.get("Type"),
+                "country": r.get("Country"),
+                "currency": r.get("Currency"),
+                "isin": r.get("ISIN") or r.get("Isin"),
+                "previous_close": _to_num(r.get("previousClose")),
+            })
+        return out
+
+    def resolve_ticker(self, query: str) -> str | None:
+        """Best-effort single-result resolution of a query to CODE.EXCHANGE.
+
+        If the query already looks like a fully-qualified ticker
+        (e.g. 'AAPL.US') it's returned as-is (upper-cased). Otherwise the
+        top Search API hit is used. Returns None when nothing matches.
+        """
+        query = (query or "").strip()
+        if not query:
+            return None
+        if "." in query and " " not in query:
+            # Looks already-qualified: SYMBOL.EXCHANGE
+            return query.upper()
+        hits = self.search_symbols(query, limit=1)
+        return hits[0]["ticker"] if hits else None
+
+    def ingest_all_for_query(self, query: str) -> str:
+        """Resolve a free-text query to a ticker, then ingest everything.
+
+        Returns the resolved ticker. Raises ValueError if nothing matched.
+        """
+        ticker = self.resolve_ticker(query)
+        if not ticker:
+            raise ValueError(f"No instrument found for {query!r}")
+        self.ingest_all_for_ticker(ticker)
+        return ticker
+
     # =================================================================
     # PRICES
     # =================================================================
@@ -420,7 +508,7 @@ class Ingestor:
         try:
             ts = datetime.fromtimestamp(int(ts_raw)) if ts_raw else datetime.utcnow()
         except (TypeError, ValueError):
-            ts = datetime.utcnow()
+            ts = dt.datetime.now(dt.UTC)
         execute(
             """INSERT INTO realtime_quotes (ticker,ts,open,high,low,close,
                                             previous_close,change,change_pct,volume)
@@ -809,6 +897,10 @@ class Ingestor:
         )
 
     def _ingest_holders(self, ticker: str, holders: dict) -> None:
+        # EODHD Holders fields (per their fundamentals glossary):
+        #   totalShares   -> percentage of the company's shares held  (pct_shares)
+        #   totalAssets   -> percentage of the holder's assets here    (pct_assets)
+        #   currentShares -> raw number of shares held                 (shares_held)
         inst = holders.get("Institutions") or {}
         iparams = []
         for row in inst.values():
@@ -816,17 +908,18 @@ class Ingestor:
                 continue
             iparams.append((
                 ticker, row.get("name"), _to_date(row.get("date")),
-                _to_num(row.get("totalShares")), _to_num(row.get("totalAssets")),
-                _to_num(row.get("currentShares")),
+                _to_num(row.get("currentShares")),   # shares_held (count)
+                _to_num(row.get("totalShares")),      # pct_shares  (% of company)
+                _to_num(row.get("totalAssets")),      # pct_assets  (% of holder assets)
             ))
         execute_many(
             """INSERT INTO institutional_holders (ticker,holder_name,report_date,
-                                                  total_shares,total_assets,pct_held)
+                                                  shares_held,pct_shares,pct_assets)
                VALUES (%s,%s,%s,%s,%s,%s)
                ON CONFLICT (ticker,holder_name,report_date) DO UPDATE SET
-                 total_shares=EXCLUDED.total_shares,
-                 total_assets=EXCLUDED.total_assets,
-                 pct_held=EXCLUDED.pct_held""",
+                 shares_held=EXCLUDED.shares_held,
+                 pct_shares=EXCLUDED.pct_shares,
+                 pct_assets=EXCLUDED.pct_assets""",
             iparams,
         )
 
@@ -837,14 +930,15 @@ class Ingestor:
                 continue
             fparams.append((
                 ticker, row.get("name"), _to_date(row.get("date")),
-                _to_num(row.get("totalShares")), _to_num(row.get("currentShares")),
+                _to_num(row.get("currentShares")),   # shares_held (count)
+                _to_num(row.get("totalShares")),      # pct_shares  (% of company)
             ))
         execute_many(
-            """INSERT INTO fund_holders (ticker,holder_name,report_date,total_shares,pct_held)
+            """INSERT INTO fund_holders (ticker,holder_name,report_date,shares_held,pct_shares)
                VALUES (%s,%s,%s,%s,%s)
                ON CONFLICT (ticker,holder_name,report_date) DO UPDATE SET
-                 total_shares=EXCLUDED.total_shares,
-                 pct_held=EXCLUDED.pct_held""",
+                 shares_held=EXCLUDED.shares_held,
+                 pct_shares=EXCLUDED.pct_shares""",
             fparams,
         )
 
@@ -912,7 +1006,7 @@ class Ingestor:
     def ingest_sentiment(self, ticker: str, from_date: str | None = None,
                          to_date: str | None = None) -> int:
         self.ensure_symbol(ticker)
-        data = _as_dict(self.api.sentiment_data(from_date=from_date, to_date=to_date, s=ticker))
+        data = _as_dict(self.api.get_sentiment(s=ticker, from_date=from_date, to_date=to_date))
         # response shape: {"AAPL.US": [{"date":..., "count":..., "normalized":...}, ...]}
         rows = data.get(ticker) or data.get(ticker.lower()) or []
         params = [
@@ -1062,9 +1156,9 @@ class Ingestor:
         if country:
             kwargs["country"] = country
         if from_date:
-            kwargs["from_date"] = from_date
+            kwargs["date_from"] = from_date
         if to_date:
-            kwargs["to_date"] = to_date
+            kwargs["date_to"] = to_date
         rows = _as_list(self.api.get_economic_events_data(**kwargs))
         params = []
         for r in rows:
@@ -1116,9 +1210,9 @@ class Ingestor:
         self.ensure_symbol(ticker)
         kwargs = {}
         if from_date:
-            kwargs["from_date"] = from_date
+            kwargs["date_from"] = from_date
         if to_date:
-            kwargs["to_date"] = to_date
+            kwargs["date_to"] = to_date
         data = _as_dict(self.api.get_options_data(ticker, **kwargs))
         snapshot = date.today()
         params = []
@@ -1182,15 +1276,15 @@ class Ingestor:
         self.ingest_splits(ticker)
         try:
             self.ingest_live(ticker)
-        except Exception as e:  # noqa: BLE001
+        except (Exception, SystemExit) as e:  # eodhd may sys.exit() on API errors
             log.warning("live(%s) skipped: %s", ticker, e)
         try:
             self.ingest_news(ticker, limit=50)
-        except Exception as e:  # noqa: BLE001
+        except (Exception, SystemExit) as e:  # eodhd may sys.exit() on API errors
             log.warning("news(%s) skipped: %s", ticker, e)
         try:
             self.ingest_sentiment(ticker)
-        except Exception as e:  # noqa: BLE001
+        except (Exception, SystemExit) as e:  # eodhd may sys.exit() on API errors
             log.warning("sentiment(%s) skipped: %s", ticker, e)
 
     def refresh_eod_all(self, since: str | None = None) -> None:
@@ -1258,6 +1352,14 @@ def _cli() -> None:
 
     s = sub.add_parser("all")
     s.add_argument("ticker")
+    s.add_argument("--resolve", action="store_true",
+                   help="treat the argument as a free-text query (company "
+                        "name or partial symbol) and resolve it via the "
+                        "Search API before ingesting")
+
+    s = sub.add_parser("search")
+    s.add_argument("query", nargs="+", help="company name or partial symbol")
+    s.add_argument("--limit", type=int, default=15)
 
     args = p.parse_args()
     ing = Ingestor()
@@ -1295,7 +1397,22 @@ def _cli() -> None:
     elif args.cmd == "options":
         ing.ingest_options(args.ticker)
     elif args.cmd == "all":
-        ing.ingest_all_for_ticker(args.ticker)
+        if getattr(args, "resolve", False):
+            resolved = ing.ingest_all_for_query(args.ticker)
+            log.info("resolved %r -> %s", args.ticker, resolved)
+        else:
+            ing.ingest_all_for_ticker(args.ticker)
+    elif args.cmd == "search":
+        q = " ".join(args.query)
+        hits = ing.search_symbols(q, limit=args.limit)
+        if not hits:
+            print(f"No matches for {q!r}")
+        else:
+            print(f"{'TICKER':<18} {'TYPE':<14} {'COUNTRY':<10} NAME")
+            print("-" * 70)
+            for h in hits:
+                print(f"{h['ticker']:<18} {(h['type'] or ''):<14} "
+                      f"{(h['country'] or ''):<10} {h['name'] or ''}")
 
 
 if __name__ == "__main__":
