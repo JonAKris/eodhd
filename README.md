@@ -41,6 +41,16 @@ psql -U postgres -h localhost -d postgres -f sql/schema.sql
 
 The schema script is idempotent for table creation (uses `CREATE TABLE IF NOT EXISTS`) but the initial `CREATE DATABASE eodhd` will error if the DB already exists — that's harmless, the rest of the script will still run after you `\c eodhd`.
 
+### Migrations (existing databases)
+
+If you already have a populated database from an earlier version, apply the migrations in `sql/migrations/` to bring the schema up to date without a full re-ingest. They are idempotent (safe to re-run):
+
+```bash
+psql -U postgres -h localhost -d postgres -f sql/migrations/2026-05-28_fix_holders_columns.sql
+```
+
+`2026-05-28_fix_holders_columns.sql` fixes a holders-data bug: EODHD's `currentShares` (a raw share *count*) was being stored in `pct_held`, while `totalShares` (the actual *percentage* of the company held) went into `total_shares`. The migration renames the columns to honest names (`shares_held`, `pct_shares`, `pct_assets`) and swaps the data so existing rows become correct. Fresh installs from `schema.sql` already have the corrected columns.
+
 ## Ingesting data
 
 The `ingest.py` CLI exposes every endpoint as a subcommand. Typical first-time workflow:
@@ -52,6 +62,13 @@ python ingest.py symbols US        # populate all US tickers
 
 # All data for one ticker (EOD prices, fundamentals, dividends, splits, live quote, news, sentiment)
 python ingest.py all AAPL.US
+
+# Look up a company by name or partial symbol (Search API)
+python ingest.py search Apple
+python ingest.py search "berkshire" --limit 5
+
+# Resolve a free-text query to a ticker, then ingest everything for it
+python ingest.py all "Apple" --resolve
 
 # Or pick & choose
 python ingest.py eod AAPL.US --from 2020-01-01
@@ -88,8 +105,8 @@ python app.py
 
 Open <http://localhost:8050>. Pages:
 
-- **`/`** — landing page with an "Ingest a ticker" form that runs `Ingestor.ingest_all_for_ticker` from the browser. Handy for trying things out without dropping back to the CLI.
-- **`/chart`** — type a ticker (autocomplete from the `symbols` table), pick a date range, chart type (Candlestick / OHLC / Line / Area), and overlays (SMA 20/50/200, Bollinger Bands). Below the chart: a fundamentals header (price, market cap, P/E, dividend yield, 52-week range) plus 12 tabs — Overview, Income Statement, Balance Sheet, Cash Flow, Valuation, Earnings, Dividends & Splits, Holders, Insider Trades, Analyst Ratings, ESG, News.
+- **`/`** — landing page with a "Quick ingest" form. Type a full ticker (`AAPL.US`) and hit **Ingest everything**, or type a company name / partial symbol, hit **Look up** to see candidate matches from the Search API, pick one, then ingest. Runs `Ingestor.ingest_all_for_ticker` from the browser.
+- **`/chart`** — type a ticker (autocomplete from the `symbols` table), pick a date range, chart type (Candlestick / OHLC / Line / Area), and overlays (SMA 20/50/200, Bollinger Bands, Volume). A **Stock Selection Guide (SSG)** checkbox renders the NAIC guide below the chart (semi-log Sales/EPS/Price with growth trendlines, P/E history, and projected 5-year buy/maybe/sell price zones). Below the chart: a fundamentals header (price, market cap, P/E, dividend yield, 52-week range) plus 12 tabs — Overview, Income Statement, Balance Sheet, Cash Flow, Valuation, Earnings, Dividends & Splits, Holders, Insider Trades, Analyst Ratings, ESG, News.
 - **`/portfolios`** — list view with full CRUD: create / rename / delete portfolios. The summary view (`portfolio_summary`) shows trade count and net cash flow per portfolio.
 - **`/portfolios/<id>`** — single portfolio view: stat cards (initial cash, current value, P&L), a trades table with full CRUD (add buy/sell, edit, delete), a positions table joining current holdings against the latest EOD price for unrealised P&L, and an equity-curve chart marking-to-market every day since the portfolio's first trade.
 
