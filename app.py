@@ -18,12 +18,14 @@ Pages:
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import dash
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from dash import ALL, Dash, Input, Output, State, callback_context, dcc, html, no_update
 from dash import dash_table
@@ -115,6 +117,62 @@ def load_financials(ticker: str, statement: str = "income",
     return pd.DataFrame(rows)
 
 
+def load_ssg_history(ticker: str, years: int = 10) -> pd.DataFrame:
+    """Annual sales, net income and EPS for the NAIC Stock Selection Guide.
+
+    Sales and net income come from annual income statements. Annual EPS is
+    summed from per-quarter earnings_history rows (falling back to
+    net_income / implied share count when EPS isn't reported). Returns a
+    DataFrame indexed oldest->newest with columns:
+        year, sales, net_income, eps
+    Rows with no usable data are dropped; the frame may be shorter than
+    `years` (or empty) for thinly-covered tickers.
+    """
+    inc = pd.DataFrame(fetch_all(
+        """SELECT date, total_revenue, net_income
+             FROM income_statements
+            WHERE ticker=%s AND period_type='yearly'
+         ORDER BY date DESC LIMIT %s""",
+        (ticker, years),
+    ))
+    eps = pd.DataFrame(fetch_all(
+        """SELECT date, eps_actual
+             FROM earnings_history
+            WHERE ticker=%s AND eps_actual IS NOT NULL
+         ORDER BY date DESC LIMIT %s""",
+        (ticker, years * 4 + 4),
+    ))
+
+    if inc.empty:
+        return pd.DataFrame(columns=["year", "sales", "net_income", "eps"])
+
+    inc["year"] = pd.to_datetime(inc["date"], errors="coerce").dt.year
+    inc["sales"] = pd.to_numeric(inc["total_revenue"], errors="coerce")
+    inc["net_income"] = pd.to_numeric(inc["net_income"], errors="coerce")
+
+    # Annual EPS: sum the four quarterly actuals reported within each fiscal year.
+    eps_by_year: dict[int, float] = {}
+    if not eps.empty:
+        eps["year"] = pd.to_datetime(eps["date"], errors="coerce").dt.year
+        eps["eps_actual"] = pd.to_numeric(eps["eps_actual"], errors="coerce")
+        grp = eps.dropna(subset=["year"]).groupby("year")
+        for yr, g in grp:
+            # Only trust a year that looks like it has full coverage (>=3 qtrs);
+            # otherwise leave it to the net-income fallback below.
+            if g["eps_actual"].notna().sum() >= 3:
+                eps_by_year[int(yr)] = float(g["eps_actual"].sum())
+
+    out = (inc[["year", "sales", "net_income"]]
+           .dropna(subset=["year"])
+           .groupby("year", as_index=False)
+           .agg({"sales": "max", "net_income": "max"}))
+    out["eps"] = out["year"].map(lambda y: eps_by_year.get(int(y)))
+    out = out.sort_values("year").reset_index(drop=True)
+    # Keep rows that have at least sales or eps to plot.
+    out = out[out[["sales", "eps"]].notna().any(axis=1)]
+    return out.reset_index(drop=True)
+
+
 def search_tickers(q: str, limit: int = 30) -> list[dict]:
     if not q:
         return []
@@ -174,13 +232,28 @@ def landing_page() -> html.Div:
         ]),
         html.Hr(),
         html.H5("Quick ingest"),
+        html.P("Type a ticker (AAPL.US), or a company name / partial symbol "
+               "and look it up.", className="text-muted small mb-2"),
         html.Div([
-            dcc.Input(id="ingest-ticker", placeholder="AAPL.US", type="text",
+            dcc.Input(id="ingest-query", placeholder="AAPL.US  or  \"Apple\"",
+                      type="text", debounce=True,
                       className="form-control d-inline-block w-25 me-2"),
-            html.Button("Ingest everything for ticker", id="ingest-btn",
+            html.Button("Look up", id="ingest-lookup-btn",
+                        className="btn btn-outline-secondary me-2"),
+            html.Button("Ingest everything", id="ingest-btn",
                         className="btn btn-primary"),
             html.Span(id="ingest-status", className="ms-3"),
-        ], className="d-flex align-items-center"),
+        ], className="d-flex align-items-center flex-wrap"),
+        html.Div([
+            dcc.Dropdown(
+                id="ingest-match",
+                placeholder="Lookup matches will appear here — pick one",
+                style={"width": "520px"},
+                className="mt-2",
+            ),
+        ], id="ingest-match-wrap", style={"display": "none"}),
+        # Remembers the resolved ticker chosen/looked-up for the ingest click.
+        dcc.Store(id="ingest-resolved"),
     ])
 
 
@@ -233,9 +306,20 @@ def chart_page(ticker: str = "AAPL.US") -> html.Div:
                 inline=True,
                 style={"display": "inline-block", "marginLeft": "12px"},
             ),
+            dcc.Checklist(
+                id="chart-show-ssg",
+                options=[{"label": " Stock Selection Guide (SSG)",
+                          "value": "ssg"}],
+                value=[],
+                inline=True,
+                style={"display": "inline-block", "marginLeft": "12px"},
+            ),
         ], className="d-flex align-items-center flex-wrap mb-3"),
 
         dcc.Loading(dcc.Graph(id="price-chart", style={"height": "620px"})),
+
+        # NAIC Stock Selection Guide (rendered only when the box is checked)
+        dcc.Loading(html.Div(id="ssg-panel", className="my-3")),
 
         # Fundamentals header card
         html.Div(id="fundamentals-header", className="my-3"),
@@ -311,7 +395,7 @@ def portfolio_detail_page(portfolio_id: str) -> html.Div:
     trades = pf.list_trades(portfolio_id)
     positions = pf.positions(portfolio_id)
     return html.Div([
-        dcc.Store(id="pid", data=portfolio_id),
+        dcc.Store(id="pid", data=_serialise(portfolio_id)),
         dcc.Link("← All portfolios", href="/portfolios"),
         html.H3(p["name"], className="mt-2"),
         html.P(p.get("description") or ""),
@@ -407,6 +491,12 @@ def _serialise(v: Any) -> Any:
         return v.isoformat()
     if isinstance(v, Decimal):
         return float(v)
+    if isinstance(v, uuid.UUID):
+        return str(v)
+    # Catch anything else Dash can't JSON-serialise (e.g. memoryview,
+    # bytes, IP addresses) by stringifying as a last resort.
+    if v is not None and not isinstance(v, (str, int, float, bool, list, dict)):
+        return str(v)
     return v
 
 
@@ -432,16 +522,69 @@ def route(pathname: str):
 # Ingest on landing
 # ---------------------------------------------------------------------
 @app.callback(
-    Output("ingest-status", "children"),
-    Input("ingest-btn", "n_clicks"),
-    State("ingest-ticker", "value"),
+    Output("ingest-match", "options"),
+    Output("ingest-match-wrap", "style"),
+    Output("ingest-status", "children", allow_duplicate=True),
+    Input("ingest-lookup-btn", "n_clicks"),
+    State("ingest-query", "value"),
     prevent_initial_call=True,
 )
-def trigger_ingest(_clicks: int, ticker: str):
-    if not ticker:
-        return "Enter a ticker first."
+def lookup_ticker(_clicks: int, query: str):
+    """Resolve a free-text query to candidate instruments via the Search API."""
+    query = (query or "").strip()
+    if not query:
+        return [], {"display": "none"}, "Enter a ticker or company name first."
     try:
-        ingestor.ingest_all_for_ticker(ticker.strip().upper())
+        hits = ingestor.search_symbols(query, limit=20)
+    except Exception as e:  # noqa: BLE001
+        log.exception("lookup failed")
+        return [], {"display": "none"}, html.Span(f"✗ {e}", className="text-danger")
+    if not hits:
+        return ([], {"display": "none"},
+                html.Span(f"No matches for “{query}”.", className="text-warning"))
+    opts = [
+        {
+            "label": f"{h['ticker']} — {h['name'] or ''}"
+                     f"  ({h['type'] or '?'}, {h['country'] or '?'})",
+            "value": h["ticker"],
+        }
+        for h in hits
+    ]
+    msg = html.Span(f"Found {len(opts)} match(es) — pick one, then Ingest.",
+                    className="text-muted")
+    return opts, {"display": "block"}, msg
+
+
+@app.callback(
+    Output("ingest-resolved", "data"),
+    Input("ingest-match", "value"),
+    prevent_initial_call=True,
+)
+def pick_match(ticker: str):
+    return ticker or no_update
+
+
+@app.callback(
+    Output("ingest-status", "children"),
+    Input("ingest-btn", "n_clicks"),
+    State("ingest-query", "value"),
+    State("ingest-resolved", "data"),
+    prevent_initial_call=True,
+)
+def trigger_ingest(_clicks: int, query: str, resolved: str | None):
+    # Priority: an explicit lookup match, else resolve the typed query.
+    ticker = (resolved or "").strip()
+    raw = (query or "").strip()
+    try:
+        if not ticker:
+            if not raw:
+                return "Enter a ticker or company name first."
+            ticker = ingestor.resolve_ticker(raw)
+            if not ticker:
+                return html.Span(
+                    f"Couldn't resolve “{raw}”. Try Look up to see matches.",
+                    className="text-warning")
+        ingestor.ingest_all_for_ticker(ticker)
         return html.Span(f"✓ Ingested {ticker}", className="text-success")
     except Exception as e:  # noqa: BLE001
         log.exception("ingest failed")
@@ -676,6 +819,27 @@ def render_fund_tab(tab: str, ticker: str):
         ], className="alert alert-danger")
 
 
+@app.callback(
+    Output("ssg-panel", "children"),
+    Input("chart-show-ssg", "value"),
+    Input("chart-ticker", "value"),
+)
+def render_ssg(show: list[str], ticker: str):
+    if not show or "ssg" not in show:
+        return None
+    if not ticker:
+        return html.Div("Pick a ticker to see its SSG.", className="text-muted")
+    try:
+        f = load_fundamentals(ticker)
+        return build_ssg(ticker, f)
+    except Exception as e:  # noqa: BLE001
+        log.exception("render_ssg(ticker=%r) failed", ticker)
+        return html.Div([
+            html.H6("Error building SSG", className="text-danger"),
+            html.Pre(f"{type(e).__name__}: {e}"),
+        ], className="alert alert-danger")
+
+
 def _fund_overview(f: dict) -> html.Div:
     rows = []
     field_map = [
@@ -859,30 +1023,263 @@ def _divsplits_view(ticker: str) -> html.Div:
     return html.Div(children)
 
 
+def _ssg_cagr(first: float, last: float, periods: int) -> float | None:
+    """Compound annual growth rate between two positive values."""
+    if first is None or last is None or periods <= 0:
+        return None
+    if first <= 0 or last <= 0:
+        return None
+    return (last / first) ** (1.0 / periods) - 1.0
+
+
+def _ssg_fit_loglinear(years: np.ndarray, values: np.ndarray):
+    """Least-squares fit of log(value) ~ year. Returns (slope, intercept,
+    annual_growth_rate) or None when there aren't enough positive points."""
+    mask = np.isfinite(values) & (values > 0)
+    if mask.sum() < 2:
+        return None
+    x = years[mask].astype(float)
+    y = np.log(values[mask].astype(float))
+    slope, intercept = np.polyfit(x, y, 1)
+    growth = float(np.exp(slope) - 1.0)
+    return float(slope), float(intercept), growth
+
+
+def build_ssg(ticker: str, f: dict | None) -> html.Div:
+    """NAIC Stock Selection Guide.
+
+    Section 1  - semi-log history of Sales, EPS and Price with growth trendlines.
+    Section 3  - P/E history (approx. 5yr high/low) and payout ratio.
+    Section 4  - projected 5-year high/low price and buy / maybe / sell zones.
+
+    Degrades gracefully: with thin history it shows what it can and explains
+    what's missing rather than erroring.
+    """
+    hist = load_ssg_history(ticker, years=10)
+    prices = load_prices(ticker, days=365 * 11)
+
+    if hist.empty and prices.empty:
+        return html.Div(
+            "Not enough stored data to build an SSG. Ingest fundamentals and "
+            "EOD prices for this ticker first.",
+            className="alert alert-warning")
+
+    notes: list[str] = []
+    f = f or {}
+
+    def _num(key):
+        v = f.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    cur_eps = _num("eps")
+    cur_pe = _num("pe_ratio")
+    div_share = _num("dividend_share")
+    last_price = float(prices["close"].iloc[-1]) if not prices.empty else None
+
+    # ---- Section 1: semi-log growth chart ----------------------------
+    sec1 = go.Figure()
+    have_growth: dict[str, float] = {}
+    if not hist.empty:
+        yrs = hist["year"].to_numpy()
+        for col, name, color in (("sales", "Sales", "#1f77b4"),
+                                 ("eps", "EPS", "#2ca02c")):
+            vals = pd.to_numeric(hist[col], errors="coerce").to_numpy()
+            if np.isfinite(vals).sum() == 0:
+                continue
+            sec1.add_trace(go.Scatter(
+                x=hist["year"], y=vals, mode="lines+markers", name=name,
+                line={"color": color}))
+            fit = _ssg_fit_loglinear(yrs, vals)
+            if fit:
+                slope, intercept, growth = fit
+                have_growth[col] = growth
+                xs = np.array([yrs.min(), yrs.max()], dtype=float)
+                ys = np.exp(intercept + slope * xs)
+                sec1.add_trace(go.Scatter(
+                    x=xs, y=ys, mode="lines", name=f"{name} trend",
+                    line={"color": color, "dash": "dash", "width": 1}))
+        if not prices.empty:
+            pr = prices.copy()
+            pr["year"] = pr["date"].dt.year
+            ye = pr.groupby("year")["close"].last()
+            sec1.add_trace(go.Scatter(
+                x=ye.index, y=ye.values, mode="lines+markers",
+                name="Price (yr-end)", line={"color": "#d62728"}))
+        sec1.update_yaxes(type="log", title="Log scale")
+        sec1.update_layout(
+            title="Section 1 — Sales, EPS & Price (semi-log)",
+            height=420, margin={"t": 48, "b": 30},
+            legend={"orientation": "h", "y": -0.18})
+    else:
+        notes.append("No annual sales/EPS history stored — Section 1 growth "
+                     "trendlines unavailable.")
+
+    sales_growth = have_growth.get("sales")
+    eps_growth = have_growth.get("eps")
+
+    # ---- Section 3: P/E history --------------------------------------
+    pe_high = pe_low = None
+    if not prices.empty and cur_eps and cur_eps > 0:
+        pr = prices.copy()
+        recent = pr[pr["date"] >= (pd.Timestamp.today() - pd.DateOffset(years=5))]
+        if not recent.empty:
+            pe_high = float(recent["high"].max() / cur_eps)
+            pe_low = float(recent["low"].min() / cur_eps)
+
+    payout = None
+    if div_share is not None and cur_eps and cur_eps > 0:
+        payout = div_share / cur_eps
+
+    # ---- Section 4: projected price zones ----------------------------
+    zone: dict = {}
+    proj_eps5 = None
+    if cur_eps and cur_eps > 0 and eps_growth is not None:
+        proj_eps5 = cur_eps * ((1 + eps_growth) ** 5)
+    if proj_eps5 and pe_high and pe_low:
+        hi = proj_eps5 * pe_high
+        lo = cur_eps * pe_low
+        if hi > lo:
+            rng = hi - lo
+            buy_top = lo + rng / 3.0
+            sell_bottom = hi - rng / 3.0
+            zone = {
+                "forecast_high": hi,
+                "forecast_low": lo,
+                "buy_below": buy_top,
+                "maybe_between": (buy_top, sell_bottom),
+                "sell_above": sell_bottom,
+            }
+
+    def _pct(v):
+        return f"{v*100:.1f}%" if isinstance(v, (int, float)) else "—"
+
+    def _money(v):
+        return f"{v:,.2f}" if isinstance(v, (int, float)) else "—"
+
+    stat_rows = [
+        ("Historical sales growth (trend)", _pct(sales_growth)),
+        ("Historical EPS growth (trend)", _pct(eps_growth)),
+        ("Current trailing EPS", _money(cur_eps)),
+        ("Current P/E", _money(cur_pe)),
+        ("5-yr high P/E (approx.)", _money(pe_high)),
+        ("5-yr low P/E (approx.)", _money(pe_low)),
+        ("Payout ratio", _pct(payout)),
+        ("Projected EPS (5 yr)", _money(proj_eps5)),
+    ]
+    stat_table = dash_table.DataTable(
+        data=[{"metric": m, "value": v} for m, v in stat_rows],
+        columns=[{"name": "Metric", "id": "metric"},
+                 {"name": "Value", "id": "value"}],
+        style_cell={"padding": "4px", "textAlign": "left"},
+        style_table={"maxWidth": "460px"})
+
+    if zone:
+        cur_txt = f" (current price {_money(last_price)})" if last_price else ""
+        zone_block = html.Div([
+            html.H6("Section 4 — Five-year price zones"),
+            html.Ul([
+                html.Li(f"Forecast high price: {_money(zone['forecast_high'])}"),
+                html.Li(f"Forecast low price: {_money(zone['forecast_low'])}"),
+                html.Li([html.Span("BUY", className="badge bg-success me-1"),
+                         f"below {_money(zone['buy_below'])}"]),
+                html.Li([html.Span("MAYBE", className="badge bg-warning text-dark me-1"),
+                         f"{_money(zone['maybe_between'][0])} – "
+                         f"{_money(zone['maybe_between'][1])}"]),
+                html.Li([html.Span("SELL", className="badge bg-danger me-1"),
+                         f"above {_money(zone['sell_above'])}"]),
+            ]),
+            html.P(f"Zones split the forecast high–low range into thirds "
+                   f"(NAIC convention).{cur_txt}",
+                   className="text-muted small"),
+        ])
+    else:
+        zone_block = html.Div(
+            "Section 4 price zones need a current EPS, an EPS growth rate, and "
+            "a P/E range — one or more is missing for this ticker.",
+            className="alert alert-secondary")
+        notes.append("Projected price zones unavailable (insufficient EPS / "
+                     "P/E history).")
+
+    children = [
+        html.H5("NAIC Stock Selection Guide"),
+        html.P("A judgment aid, not advice. Growth rates are fit from stored "
+               "history and may be short for thinly-covered tickers.",
+               className="text-muted small"),
+    ]
+    if not hist.empty:
+        children.append(dcc.Graph(figure=sec1, config={"displayModeBar": False}))
+    children.append(html.Div([
+        html.Div([html.H6("Section 3 — Evaluating risk & reward"), stat_table],
+                 className="col-md-6"),
+        html.Div(zone_block, className="col-md-6"),
+    ], className="row mt-3"))
+    if notes:
+        children.append(html.Ul([html.Li(n) for n in notes],
+                                className="text-muted small mt-2"))
+    return html.Div(children, className="border rounded p-3")
+
+
 def _holders_view(ticker: str) -> html.Div:
     inst = pd.DataFrame(fetch_all(
-        "SELECT holder_name,report_date,total_shares,total_assets,pct_held "
+        "SELECT holder_name,report_date,shares_held,pct_shares,pct_assets "
         "FROM institutional_holders WHERE ticker=%s "
-        "ORDER BY total_shares DESC NULLS LAST LIMIT 50", (ticker,)))
+        "ORDER BY pct_shares DESC NULLS LAST LIMIT 50", (ticker,)))
     funds = pd.DataFrame(fetch_all(
-        "SELECT holder_name,report_date,total_shares,pct_held "
+        "SELECT holder_name,report_date,shares_held,pct_shares "
         "FROM fund_holders WHERE ticker=%s "
-        "ORDER BY total_shares DESC NULLS LAST LIMIT 50", (ticker,)))
+        "ORDER BY pct_shares DESC NULLS LAST LIMIT 50", (ticker,)))
+
+    def _fmt(df: pd.DataFrame, has_assets: bool) -> pd.DataFrame:
+        if df.empty:
+            return df
+        df = df.copy()
+        if "report_date" in df:
+            df["report_date"] = pd.to_datetime(
+                df["report_date"], errors="coerce").dt.date.astype("string")
+        # shares_held is a raw count -> thousands separators
+        df["shares_held"] = pd.to_numeric(df["shares_held"], errors="coerce")
+        df["shares_held"] = df["shares_held"].map(
+            lambda v: f"{v:,.0f}" if pd.notna(v) else "")
+        # pct_* are already percentages from EODHD (e.g. 1.25 == 1.25%)
+        for c in (["pct_shares", "pct_assets"] if has_assets else ["pct_shares"]):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = df[c].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
+        return df
+
+    inst = _fmt(inst, has_assets=True)
+    funds = _fmt(funds, has_assets=False)
+
+    labels = {
+        "holder_name": "Holder",
+        "report_date": "Report date",
+        "shares_held": "Shares held",
+        "pct_shares": "% of shares",
+        "pct_assets": "% of holder assets",
+    }
+
+    def _table(df: pd.DataFrame) -> dash_table.DataTable:
+        cols = list(df.columns) if not df.empty else []
+        return dash_table.DataTable(
+            data=df.to_dict("records") if not df.empty else [],
+            columns=[{"name": labels.get(c, c), "id": c} for c in cols],
+            page_size=15, style_cell={"padding": "4px"},
+            style_cell_conditional=[
+                {"if": {"column_id": c}, "textAlign": "right"}
+                for c in ("shares_held", "pct_shares", "pct_assets")
+            ],
+            style_table={"overflowX": "auto"},
+        )
+
     return html.Div([
         html.H6("Institutional holders"),
-        dash_table.DataTable(
-            data=inst.to_dict("records") if not inst.empty else [],
-            columns=[{"name": c, "id": c} for c in (inst.columns if not inst.empty else [])],
-            page_size=15, style_cell={"padding": "4px"},
-            style_table={"overflowX": "auto"},
-        ),
+        _table(inst) if not inst.empty
+        else html.Div("No institutional holders on file.", className="text-muted"),
         html.H6("Fund holders", className="mt-3"),
-        dash_table.DataTable(
-            data=funds.to_dict("records") if not funds.empty else [],
-            columns=[{"name": c, "id": c} for c in (funds.columns if not funds.empty else [])],
-            page_size=15, style_cell={"padding": "4px"},
-            style_table={"overflowX": "auto"},
-        ),
+        _table(funds) if not funds.empty
+        else html.Div("No fund holders on file.", className="text-muted"),
     ])
 
 
@@ -1009,7 +1406,7 @@ def _portfolio_form(initial: dict | None = None) -> html.Div:
             className="btn btn-primary me-2",
         ),
         html.Button("Cancel", id="pf-cancel-btn", className="btn btn-secondary"),
-        dcc.Store(id="pf-edit-id", data=initial.get("id")),
+        dcc.Store(id="pf-edit-id", data=_serialise(initial.get("id"))),
     ], className="border rounded p-3 bg-light")
 
 
@@ -1107,7 +1504,7 @@ def _trade_form(portfolio_id: str, initial: dict | None = None) -> html.Div:
             html.Div([
                 html.Label("Date"),
                 dcc.Input(id="tr-date", type="text",
-                          value=initial.get("trade_date") or today,
+                          value=_serialise(initial.get("trade_date")) or today,
                           className="form-control"),
             ], className="col-md-2"),
         ], className="row mb-2"),
@@ -1146,8 +1543,8 @@ def _trade_form(portfolio_id: str, initial: dict | None = None) -> html.Div:
         html.Button("Save" if initial else "Add",
                     id="tr-save-btn", className="btn btn-primary me-2"),
         html.Button("Cancel", id="tr-cancel-btn", className="btn btn-secondary"),
-        dcc.Store(id="tr-edit-id", data=initial.get("id")),
-        dcc.Store(id="tr-portfolio-id", data=portfolio_id),
+        dcc.Store(id="tr-edit-id", data=_serialise(initial.get("id"))),
+        dcc.Store(id="tr-portfolio-id", data=_serialise(portfolio_id)),
     ], className="border rounded p-3 bg-light")
 
 
