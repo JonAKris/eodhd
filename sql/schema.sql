@@ -2,15 +2,14 @@
 -- PostgreSQL database dump
 --
 
-\restrict fSWdgu8UmvUgcTUPMfCVLfZjHqoqHa3xJrUYk3JKhNYjnGtpARHPVmXGo7QGUVY
+\restrict EIMFcdFZoCyPFH1zHLwfq4L0ZIeUEt0LMCsZzKXl2mwn6iXNNSReQXQESqPKs6f
 
 -- Dumped from database version 16.14 (Ubuntu 16.14-1.pgdg24.04+1)
--- Dumped by pg_dump version 18.4 (Ubuntu 18.4-1.pgdg24.04+1)
+-- Dumped by pg_dump version 16.14 (Ubuntu 16.14-1.pgdg24.04+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
-SET transaction_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SELECT pg_catalog.set_config('search_path', '', false);
@@ -20,49 +19,14 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
--- Name: btree_gin; Type: EXTENSION; Schema: -; Owner: -
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
 --
 
-CREATE EXTENSION IF NOT EXISTS btree_gin WITH SCHEMA public;
-
-
---
--- Name: EXTENSION btree_gin; Type: COMMENT; Schema: -; Owner: 
---
-
-COMMENT ON EXTENSION btree_gin IS 'support for indexing common datatypes in GIN';
+CREATE SCHEMA public;
 
 
 --
--- Name: pg_trgm; Type: EXTENSION; Schema: -; Owner: -
---
-
-CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
-
-
---
--- Name: EXTENSION pg_trgm; Type: COMMENT; Schema: -; Owner: 
---
-
-COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
-
-
---
--- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
---
-
-CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
-
-
---
--- Name: EXTENSION pgcrypto; Type: COMMENT; Schema: -; Owner: 
---
-
-COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
-
-
---
--- Name: touch_updated_at(); Type: FUNCTION; Schema: public; Owner: postgres
+-- Name: touch_updated_at(); Type: FUNCTION; Schema: public; Owner: -
 --
 
 CREATE FUNCTION public.touch_updated_at() RETURNS trigger
@@ -75,14 +39,12 @@ END;
 $$;
 
 
-ALTER FUNCTION public.touch_updated_at() OWNER TO postgres;
-
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
 
 --
--- Name: analyst_ratings_history; Type: TABLE; Schema: public; Owner: postgres
+-- Name: analyst_ratings_history; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.analyst_ratings_history (
@@ -98,10 +60,8 @@ CREATE TABLE public.analyst_ratings_history (
 );
 
 
-ALTER TABLE public.analyst_ratings_history OWNER TO postgres;
-
 --
--- Name: balance_sheets; Type: TABLE; Schema: public; Owner: postgres
+-- Name: balance_sheets; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.balance_sheets (
@@ -127,10 +87,8 @@ CREATE TABLE public.balance_sheets (
 );
 
 
-ALTER TABLE public.balance_sheets OWNER TO postgres;
-
 --
--- Name: bond_fundamentals; Type: TABLE; Schema: public; Owner: postgres
+-- Name: bond_fundamentals; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.bond_fundamentals (
@@ -146,10 +104,8 @@ CREATE TABLE public.bond_fundamentals (
 );
 
 
-ALTER TABLE public.bond_fundamentals OWNER TO postgres;
-
 --
--- Name: cash_flow_statements; Type: TABLE; Schema: public; Owner: postgres
+-- Name: cash_flow_statements; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.cash_flow_statements (
@@ -170,10 +126,8 @@ CREATE TABLE public.cash_flow_statements (
 );
 
 
-ALTER TABLE public.cash_flow_statements OWNER TO postgres;
-
 --
--- Name: dividends; Type: TABLE; Schema: public; Owner: postgres
+-- Name: dividends; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.dividends (
@@ -189,10 +143,8 @@ CREATE TABLE public.dividends (
 );
 
 
-ALTER TABLE public.dividends OWNER TO postgres;
-
 --
--- Name: earnings_calendar; Type: TABLE; Schema: public; Owner: postgres
+-- Name: earnings_calendar; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.earnings_calendar (
@@ -208,10 +160,8 @@ CREATE TABLE public.earnings_calendar (
 );
 
 
-ALTER TABLE public.earnings_calendar OWNER TO postgres;
-
 --
--- Name: earnings_history; Type: TABLE; Schema: public; Owner: postgres
+-- Name: earnings_history; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.earnings_history (
@@ -227,10 +177,8 @@ CREATE TABLE public.earnings_history (
 );
 
 
-ALTER TABLE public.earnings_history OWNER TO postgres;
-
 --
--- Name: earnings_trend; Type: TABLE; Schema: public; Owner: postgres
+-- Name: earnings_trend; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.earnings_trend (
@@ -247,10 +195,8 @@ CREATE TABLE public.earnings_trend (
 );
 
 
-ALTER TABLE public.earnings_trend OWNER TO postgres;
-
 --
--- Name: economic_events; Type: TABLE; Schema: public; Owner: postgres
+-- Name: economic_events; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.economic_events (
@@ -268,10 +214,8 @@ CREATE TABLE public.economic_events (
 );
 
 
-ALTER TABLE public.economic_events OWNER TO postgres;
-
 --
--- Name: economic_events_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+-- Name: economic_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
 CREATE SEQUENCE public.economic_events_id_seq
@@ -282,17 +226,15 @@ CREATE SEQUENCE public.economic_events_id_seq
     CACHE 1;
 
 
-ALTER SEQUENCE public.economic_events_id_seq OWNER TO postgres;
-
 --
--- Name: economic_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+-- Name: economic_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.economic_events_id_seq OWNED BY public.economic_events.id;
 
 
 --
--- Name: eod_prices; Type: TABLE; Schema: public; Owner: postgres
+-- Name: eod_prices; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.eod_prices (
@@ -307,10 +249,8 @@ CREATE TABLE public.eod_prices (
 );
 
 
-ALTER TABLE public.eod_prices OWNER TO postgres;
-
 --
--- Name: exchange_details; Type: TABLE; Schema: public; Owner: postgres
+-- Name: exchange_details; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.exchange_details (
@@ -323,10 +263,8 @@ CREATE TABLE public.exchange_details (
 );
 
 
-ALTER TABLE public.exchange_details OWNER TO postgres;
-
 --
--- Name: exchanges; Type: TABLE; Schema: public; Owner: postgres
+-- Name: exchanges; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.exchanges (
@@ -341,10 +279,8 @@ CREATE TABLE public.exchanges (
 );
 
 
-ALTER TABLE public.exchanges OWNER TO postgres;
-
 --
--- Name: fund_holders; Type: TABLE; Schema: public; Owner: postgres
+-- Name: fund_holders; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.fund_holders (
@@ -356,10 +292,8 @@ CREATE TABLE public.fund_holders (
 );
 
 
-ALTER TABLE public.fund_holders OWNER TO postgres;
-
 --
--- Name: fundamentals; Type: TABLE; Schema: public; Owner: postgres
+-- Name: fundamentals; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.fundamentals (
@@ -419,10 +353,8 @@ CREATE TABLE public.fundamentals (
 );
 
 
-ALTER TABLE public.fundamentals OWNER TO postgres;
-
 --
--- Name: historical_market_cap; Type: TABLE; Schema: public; Owner: postgres
+-- Name: historical_market_cap; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.historical_market_cap (
@@ -432,10 +364,8 @@ CREATE TABLE public.historical_market_cap (
 );
 
 
-ALTER TABLE public.historical_market_cap OWNER TO postgres;
-
 --
--- Name: income_statements; Type: TABLE; Schema: public; Owner: postgres
+-- Name: income_statements; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.income_statements (
@@ -461,10 +391,8 @@ CREATE TABLE public.income_statements (
 );
 
 
-ALTER TABLE public.income_statements OWNER TO postgres;
-
 --
--- Name: index_constituents; Type: TABLE; Schema: public; Owner: postgres
+-- Name: index_constituents; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.index_constituents (
@@ -480,10 +408,8 @@ CREATE TABLE public.index_constituents (
 );
 
 
-ALTER TABLE public.index_constituents OWNER TO postgres;
-
 --
--- Name: ingest_log; Type: TABLE; Schema: public; Owner: postgres
+-- Name: ingest_log; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.ingest_log (
@@ -499,10 +425,8 @@ CREATE TABLE public.ingest_log (
 );
 
 
-ALTER TABLE public.ingest_log OWNER TO postgres;
-
 --
--- Name: ingest_log_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+-- Name: ingest_log_id_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
 CREATE SEQUENCE public.ingest_log_id_seq
@@ -513,17 +437,15 @@ CREATE SEQUENCE public.ingest_log_id_seq
     CACHE 1;
 
 
-ALTER SEQUENCE public.ingest_log_id_seq OWNER TO postgres;
-
 --
--- Name: ingest_log_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+-- Name: ingest_log_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.ingest_log_id_seq OWNED BY public.ingest_log.id;
 
 
 --
--- Name: insider_transactions; Type: TABLE; Schema: public; Owner: postgres
+-- Name: insider_transactions; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.insider_transactions (
@@ -540,10 +462,8 @@ CREATE TABLE public.insider_transactions (
 );
 
 
-ALTER TABLE public.insider_transactions OWNER TO postgres;
-
 --
--- Name: institutional_holders; Type: TABLE; Schema: public; Owner: postgres
+-- Name: institutional_holders; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.institutional_holders (
@@ -556,10 +476,8 @@ CREATE TABLE public.institutional_holders (
 );
 
 
-ALTER TABLE public.institutional_holders OWNER TO postgres;
-
 --
--- Name: intraday_prices; Type: TABLE; Schema: public; Owner: postgres
+-- Name: intraday_prices; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.intraday_prices (
@@ -574,10 +492,8 @@ CREATE TABLE public.intraday_prices (
 );
 
 
-ALTER TABLE public.intraday_prices OWNER TO postgres;
-
 --
--- Name: ipo_calendar; Type: TABLE; Schema: public; Owner: postgres
+-- Name: ipo_calendar; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.ipo_calendar (
@@ -596,10 +512,8 @@ CREATE TABLE public.ipo_calendar (
 );
 
 
-ALTER TABLE public.ipo_calendar OWNER TO postgres;
-
 --
--- Name: macro_indicators; Type: TABLE; Schema: public; Owner: postgres
+-- Name: macro_indicators; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.macro_indicators (
@@ -610,10 +524,8 @@ CREATE TABLE public.macro_indicators (
 );
 
 
-ALTER TABLE public.macro_indicators OWNER TO postgres;
-
 --
--- Name: news; Type: TABLE; Schema: public; Owner: postgres
+-- Name: news; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.news (
@@ -633,10 +545,8 @@ CREATE TABLE public.news (
 );
 
 
-ALTER TABLE public.news OWNER TO postgres;
-
 --
--- Name: news_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+-- Name: news_id_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
 CREATE SEQUENCE public.news_id_seq
@@ -647,17 +557,15 @@ CREATE SEQUENCE public.news_id_seq
     CACHE 1;
 
 
-ALTER SEQUENCE public.news_id_seq OWNER TO postgres;
-
 --
--- Name: news_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+-- Name: news_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.news_id_seq OWNED BY public.news.id;
 
 
 --
--- Name: options_chains; Type: TABLE; Schema: public; Owner: postgres
+-- Name: options_chains; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.options_chains (
@@ -688,10 +596,8 @@ CREATE TABLE public.options_chains (
 );
 
 
-ALTER TABLE public.options_chains OWNER TO postgres;
-
 --
--- Name: options_chains_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+-- Name: options_chains_id_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
 CREATE SEQUENCE public.options_chains_id_seq
@@ -702,17 +608,15 @@ CREATE SEQUENCE public.options_chains_id_seq
     CACHE 1;
 
 
-ALTER SEQUENCE public.options_chains_id_seq OWNER TO postgres;
-
 --
--- Name: options_chains_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+-- Name: options_chains_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.options_chains_id_seq OWNED BY public.options_chains.id;
 
 
 --
--- Name: trades; Type: TABLE; Schema: public; Owner: postgres
+-- Name: trades; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.trades (
@@ -733,10 +637,8 @@ CREATE TABLE public.trades (
 );
 
 
-ALTER TABLE public.trades OWNER TO postgres;
-
 --
--- Name: portfolio_positions; Type: VIEW; Schema: public; Owner: postgres
+-- Name: portfolio_positions; Type: VIEW; Schema: public; Owner: -
 --
 
 CREATE VIEW public.portfolio_positions AS
@@ -780,10 +682,8 @@ CREATE VIEW public.portfolio_positions AS
         END) <> (0)::numeric);
 
 
-ALTER VIEW public.portfolio_positions OWNER TO postgres;
-
 --
--- Name: portfolios; Type: TABLE; Schema: public; Owner: postgres
+-- Name: portfolios; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.portfolios (
@@ -798,10 +698,8 @@ CREATE TABLE public.portfolios (
 );
 
 
-ALTER TABLE public.portfolios OWNER TO postgres;
-
 --
--- Name: portfolio_summary; Type: VIEW; Schema: public; Owner: postgres
+-- Name: portfolio_summary; Type: VIEW; Schema: public; Owner: -
 --
 
 CREATE VIEW public.portfolio_summary AS
@@ -827,10 +725,8 @@ CREATE VIEW public.portfolio_summary AS
   GROUP BY p.id, p.user_id, p.name, p.base_currency, p.initial_cash;
 
 
-ALTER VIEW public.portfolio_summary OWNER TO postgres;
-
 --
--- Name: realtime_quotes; Type: TABLE; Schema: public; Owner: postgres
+-- Name: realtime_quotes; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.realtime_quotes (
@@ -848,10 +744,8 @@ CREATE TABLE public.realtime_quotes (
 );
 
 
-ALTER TABLE public.realtime_quotes OWNER TO postgres;
-
 --
--- Name: sentiment_daily; Type: TABLE; Schema: public; Owner: postgres
+-- Name: sentiment_daily; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.sentiment_daily (
@@ -862,10 +756,8 @@ CREATE TABLE public.sentiment_daily (
 );
 
 
-ALTER TABLE public.sentiment_daily OWNER TO postgres;
-
 --
--- Name: shares_outstanding; Type: TABLE; Schema: public; Owner: postgres
+-- Name: shares_outstanding; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.shares_outstanding (
@@ -876,10 +768,8 @@ CREATE TABLE public.shares_outstanding (
 );
 
 
-ALTER TABLE public.shares_outstanding OWNER TO postgres;
-
 --
--- Name: splits; Type: TABLE; Schema: public; Owner: postgres
+-- Name: splits; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.splits (
@@ -891,10 +781,8 @@ CREATE TABLE public.splits (
 );
 
 
-ALTER TABLE public.splits OWNER TO postgres;
-
 --
--- Name: splits_calendar; Type: TABLE; Schema: public; Owner: postgres
+-- Name: splits_calendar; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.splits_calendar (
@@ -910,10 +798,8 @@ CREATE TABLE public.splits_calendar (
 );
 
 
-ALTER TABLE public.splits_calendar OWNER TO postgres;
-
 --
--- Name: symbol_change_history; Type: TABLE; Schema: public; Owner: postgres
+-- Name: symbol_change_history; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.symbol_change_history (
@@ -925,10 +811,8 @@ CREATE TABLE public.symbol_change_history (
 );
 
 
-ALTER TABLE public.symbol_change_history OWNER TO postgres;
-
 --
--- Name: symbol_change_history_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+-- Name: symbol_change_history_id_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
 CREATE SEQUENCE public.symbol_change_history_id_seq
@@ -939,17 +823,15 @@ CREATE SEQUENCE public.symbol_change_history_id_seq
     CACHE 1;
 
 
-ALTER SEQUENCE public.symbol_change_history_id_seq OWNER TO postgres;
-
 --
--- Name: symbol_change_history_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+-- Name: symbol_change_history_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.symbol_change_history_id_seq OWNED BY public.symbol_change_history.id;
 
 
 --
--- Name: symbols; Type: TABLE; Schema: public; Owner: postgres
+-- Name: symbols; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.symbols (
@@ -967,10 +849,8 @@ CREATE TABLE public.symbols (
 );
 
 
-ALTER TABLE public.symbols OWNER TO postgres;
-
 --
--- Name: technical_indicators; Type: TABLE; Schema: public; Owner: postgres
+-- Name: technical_indicators; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.technical_indicators (
@@ -983,10 +863,8 @@ CREATE TABLE public.technical_indicators (
 );
 
 
-ALTER TABLE public.technical_indicators OWNER TO postgres;
-
 --
--- Name: tick_data; Type: TABLE; Schema: public; Owner: postgres
+-- Name: tick_data; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.tick_data (
@@ -999,10 +877,8 @@ CREATE TABLE public.tick_data (
 );
 
 
-ALTER TABLE public.tick_data OWNER TO postgres;
-
 --
--- Name: tick_data_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+-- Name: tick_data_id_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
 CREATE SEQUENCE public.tick_data_id_seq
@@ -1013,17 +889,15 @@ CREATE SEQUENCE public.tick_data_id_seq
     CACHE 1;
 
 
-ALTER SEQUENCE public.tick_data_id_seq OWNER TO postgres;
-
 --
--- Name: tick_data_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+-- Name: tick_data_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
 ALTER SEQUENCE public.tick_data_id_seq OWNED BY public.tick_data.id;
 
 
 --
--- Name: users; Type: TABLE; Schema: public; Owner: postgres
+-- Name: users; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.users (
@@ -1034,52 +908,50 @@ CREATE TABLE public.users (
 );
 
 
-ALTER TABLE public.users OWNER TO postgres;
-
 --
--- Name: economic_events id; Type: DEFAULT; Schema: public; Owner: postgres
+-- Name: economic_events id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.economic_events ALTER COLUMN id SET DEFAULT nextval('public.economic_events_id_seq'::regclass);
 
 
 --
--- Name: ingest_log id; Type: DEFAULT; Schema: public; Owner: postgres
+-- Name: ingest_log id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.ingest_log ALTER COLUMN id SET DEFAULT nextval('public.ingest_log_id_seq'::regclass);
 
 
 --
--- Name: news id; Type: DEFAULT; Schema: public; Owner: postgres
+-- Name: news id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.news ALTER COLUMN id SET DEFAULT nextval('public.news_id_seq'::regclass);
 
 
 --
--- Name: options_chains id; Type: DEFAULT; Schema: public; Owner: postgres
+-- Name: options_chains id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.options_chains ALTER COLUMN id SET DEFAULT nextval('public.options_chains_id_seq'::regclass);
 
 
 --
--- Name: symbol_change_history id; Type: DEFAULT; Schema: public; Owner: postgres
+-- Name: symbol_change_history id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.symbol_change_history ALTER COLUMN id SET DEFAULT nextval('public.symbol_change_history_id_seq'::regclass);
 
 
 --
--- Name: tick_data id; Type: DEFAULT; Schema: public; Owner: postgres
+-- Name: tick_data id; Type: DEFAULT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.tick_data ALTER COLUMN id SET DEFAULT nextval('public.tick_data_id_seq'::regclass);
 
 
 --
--- Name: analyst_ratings_history analyst_ratings_history_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: analyst_ratings_history analyst_ratings_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.analyst_ratings_history
@@ -1087,7 +959,7 @@ ALTER TABLE ONLY public.analyst_ratings_history
 
 
 --
--- Name: balance_sheets balance_sheets_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: balance_sheets balance_sheets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.balance_sheets
@@ -1095,7 +967,7 @@ ALTER TABLE ONLY public.balance_sheets
 
 
 --
--- Name: bond_fundamentals bond_fundamentals_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: bond_fundamentals bond_fundamentals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.bond_fundamentals
@@ -1103,7 +975,7 @@ ALTER TABLE ONLY public.bond_fundamentals
 
 
 --
--- Name: cash_flow_statements cash_flow_statements_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: cash_flow_statements cash_flow_statements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.cash_flow_statements
@@ -1111,7 +983,7 @@ ALTER TABLE ONLY public.cash_flow_statements
 
 
 --
--- Name: dividends dividends_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: dividends dividends_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.dividends
@@ -1119,7 +991,7 @@ ALTER TABLE ONLY public.dividends
 
 
 --
--- Name: earnings_calendar earnings_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: earnings_calendar earnings_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.earnings_calendar
@@ -1127,7 +999,7 @@ ALTER TABLE ONLY public.earnings_calendar
 
 
 --
--- Name: earnings_history earnings_history_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: earnings_history earnings_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.earnings_history
@@ -1135,7 +1007,7 @@ ALTER TABLE ONLY public.earnings_history
 
 
 --
--- Name: earnings_trend earnings_trend_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: earnings_trend earnings_trend_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.earnings_trend
@@ -1143,7 +1015,7 @@ ALTER TABLE ONLY public.earnings_trend
 
 
 --
--- Name: economic_events economic_events_event_date_country_type_period_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: economic_events economic_events_event_date_country_type_period_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.economic_events
@@ -1151,7 +1023,7 @@ ALTER TABLE ONLY public.economic_events
 
 
 --
--- Name: economic_events economic_events_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: economic_events economic_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.economic_events
@@ -1159,7 +1031,7 @@ ALTER TABLE ONLY public.economic_events
 
 
 --
--- Name: eod_prices eod_prices_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: eod_prices eod_prices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.eod_prices
@@ -1167,7 +1039,7 @@ ALTER TABLE ONLY public.eod_prices
 
 
 --
--- Name: exchange_details exchange_details_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: exchange_details exchange_details_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.exchange_details
@@ -1175,7 +1047,7 @@ ALTER TABLE ONLY public.exchange_details
 
 
 --
--- Name: exchanges exchanges_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: exchanges exchanges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.exchanges
@@ -1183,7 +1055,7 @@ ALTER TABLE ONLY public.exchanges
 
 
 --
--- Name: fund_holders fund_holders_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: fund_holders fund_holders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.fund_holders
@@ -1191,7 +1063,7 @@ ALTER TABLE ONLY public.fund_holders
 
 
 --
--- Name: fundamentals fundamentals_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: fundamentals fundamentals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.fundamentals
@@ -1199,7 +1071,7 @@ ALTER TABLE ONLY public.fundamentals
 
 
 --
--- Name: historical_market_cap historical_market_cap_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: historical_market_cap historical_market_cap_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.historical_market_cap
@@ -1207,7 +1079,7 @@ ALTER TABLE ONLY public.historical_market_cap
 
 
 --
--- Name: income_statements income_statements_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: income_statements income_statements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.income_statements
@@ -1215,7 +1087,7 @@ ALTER TABLE ONLY public.income_statements
 
 
 --
--- Name: index_constituents index_constituents_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: index_constituents index_constituents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.index_constituents
@@ -1223,7 +1095,7 @@ ALTER TABLE ONLY public.index_constituents
 
 
 --
--- Name: ingest_log ingest_log_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: ingest_log ingest_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.ingest_log
@@ -1231,7 +1103,7 @@ ALTER TABLE ONLY public.ingest_log
 
 
 --
--- Name: insider_transactions insider_transactions_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: insider_transactions insider_transactions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.insider_transactions
@@ -1239,7 +1111,7 @@ ALTER TABLE ONLY public.insider_transactions
 
 
 --
--- Name: institutional_holders institutional_holders_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: institutional_holders institutional_holders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.institutional_holders
@@ -1247,7 +1119,7 @@ ALTER TABLE ONLY public.institutional_holders
 
 
 --
--- Name: intraday_prices intraday_prices_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: intraday_prices intraday_prices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.intraday_prices
@@ -1255,7 +1127,7 @@ ALTER TABLE ONLY public.intraday_prices
 
 
 --
--- Name: ipo_calendar ipo_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: ipo_calendar ipo_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.ipo_calendar
@@ -1263,7 +1135,7 @@ ALTER TABLE ONLY public.ipo_calendar
 
 
 --
--- Name: macro_indicators macro_indicators_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: macro_indicators macro_indicators_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.macro_indicators
@@ -1271,7 +1143,7 @@ ALTER TABLE ONLY public.macro_indicators
 
 
 --
--- Name: news news_eodhd_uuid_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: news news_eodhd_uuid_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.news
@@ -1279,7 +1151,7 @@ ALTER TABLE ONLY public.news
 
 
 --
--- Name: news news_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: news news_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.news
@@ -1287,7 +1159,7 @@ ALTER TABLE ONLY public.news
 
 
 --
--- Name: options_chains options_chains_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: options_chains options_chains_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.options_chains
@@ -1295,7 +1167,7 @@ ALTER TABLE ONLY public.options_chains
 
 
 --
--- Name: options_chains options_chains_ticker_expiration_date_option_type_strike_sn_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: options_chains options_chains_ticker_expiration_date_option_type_strike_sn_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.options_chains
@@ -1303,7 +1175,7 @@ ALTER TABLE ONLY public.options_chains
 
 
 --
--- Name: portfolios portfolios_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: portfolios portfolios_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.portfolios
@@ -1311,7 +1183,7 @@ ALTER TABLE ONLY public.portfolios
 
 
 --
--- Name: portfolios portfolios_user_id_name_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: portfolios portfolios_user_id_name_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.portfolios
@@ -1319,7 +1191,7 @@ ALTER TABLE ONLY public.portfolios
 
 
 --
--- Name: realtime_quotes realtime_quotes_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: realtime_quotes realtime_quotes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.realtime_quotes
@@ -1327,7 +1199,7 @@ ALTER TABLE ONLY public.realtime_quotes
 
 
 --
--- Name: sentiment_daily sentiment_daily_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: sentiment_daily sentiment_daily_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.sentiment_daily
@@ -1335,7 +1207,7 @@ ALTER TABLE ONLY public.sentiment_daily
 
 
 --
--- Name: shares_outstanding shares_outstanding_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: shares_outstanding shares_outstanding_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.shares_outstanding
@@ -1343,7 +1215,7 @@ ALTER TABLE ONLY public.shares_outstanding
 
 
 --
--- Name: splits_calendar splits_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: splits_calendar splits_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.splits_calendar
@@ -1351,7 +1223,7 @@ ALTER TABLE ONLY public.splits_calendar
 
 
 --
--- Name: splits splits_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: splits splits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.splits
@@ -1359,7 +1231,7 @@ ALTER TABLE ONLY public.splits
 
 
 --
--- Name: symbol_change_history symbol_change_history_date_old_symbol_new_symbol_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: symbol_change_history symbol_change_history_date_old_symbol_new_symbol_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.symbol_change_history
@@ -1367,7 +1239,7 @@ ALTER TABLE ONLY public.symbol_change_history
 
 
 --
--- Name: symbol_change_history symbol_change_history_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: symbol_change_history symbol_change_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.symbol_change_history
@@ -1375,7 +1247,7 @@ ALTER TABLE ONLY public.symbol_change_history
 
 
 --
--- Name: symbols symbols_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: symbols symbols_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.symbols
@@ -1383,7 +1255,7 @@ ALTER TABLE ONLY public.symbols
 
 
 --
--- Name: technical_indicators technical_indicators_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: technical_indicators technical_indicators_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.technical_indicators
@@ -1391,7 +1263,7 @@ ALTER TABLE ONLY public.technical_indicators
 
 
 --
--- Name: tick_data tick_data_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: tick_data tick_data_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.tick_data
@@ -1399,7 +1271,7 @@ ALTER TABLE ONLY public.tick_data
 
 
 --
--- Name: trades trades_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: trades trades_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.trades
@@ -1407,7 +1279,7 @@ ALTER TABLE ONLY public.trades
 
 
 --
--- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.users
@@ -1415,7 +1287,7 @@ ALTER TABLE ONLY public.users
 
 
 --
--- Name: users users_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: users users_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.users
@@ -1423,175 +1295,175 @@ ALTER TABLE ONLY public.users
 
 
 --
--- Name: economic_events_country_date_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: economic_events_country_date_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX economic_events_country_date_idx ON public.economic_events USING btree (country, event_date DESC);
 
 
 --
--- Name: eod_prices_date_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: eod_prices_date_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX eod_prices_date_idx ON public.eod_prices USING btree (date);
 
 
 --
--- Name: fundamentals_country_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: fundamentals_country_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX fundamentals_country_idx ON public.fundamentals USING btree (country);
 
 
 --
--- Name: fundamentals_financials_gin; Type: INDEX; Schema: public; Owner: postgres
+-- Name: fundamentals_financials_gin; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX fundamentals_financials_gin ON public.fundamentals USING gin (financials);
 
 
 --
--- Name: fundamentals_general_gin; Type: INDEX; Schema: public; Owner: postgres
+-- Name: fundamentals_general_gin; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX fundamentals_general_gin ON public.fundamentals USING gin (general);
 
 
 --
--- Name: fundamentals_industry_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: fundamentals_industry_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX fundamentals_industry_idx ON public.fundamentals USING btree (industry);
 
 
 --
--- Name: fundamentals_sector_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: fundamentals_sector_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX fundamentals_sector_idx ON public.fundamentals USING btree (sector);
 
 
 --
--- Name: ingest_log_endpoint_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: ingest_log_endpoint_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX ingest_log_endpoint_idx ON public.ingest_log USING btree (endpoint, started_at DESC);
 
 
 --
--- Name: intraday_prices_ts_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: intraday_prices_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX intraday_prices_ts_idx ON public.intraday_prices USING btree (ts);
 
 
 --
--- Name: news_symbols_gin; Type: INDEX; Schema: public; Owner: postgres
+-- Name: news_symbols_gin; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX news_symbols_gin ON public.news USING gin (symbols);
 
 
 --
--- Name: news_tags_gin; Type: INDEX; Schema: public; Owner: postgres
+-- Name: news_tags_gin; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX news_tags_gin ON public.news USING gin (tags);
 
 
 --
--- Name: news_ticker_ts_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: news_ticker_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX news_ticker_ts_idx ON public.news USING btree (ticker, published_at DESC);
 
 
 --
--- Name: options_chains_ticker_exp_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: options_chains_ticker_exp_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX options_chains_ticker_exp_idx ON public.options_chains USING btree (ticker, expiration_date);
 
 
 --
--- Name: symbols_code_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: symbols_code_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX symbols_code_idx ON public.symbols USING btree (code);
 
 
 --
--- Name: symbols_exchange_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: symbols_exchange_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX symbols_exchange_idx ON public.symbols USING btree (exchange_code);
 
 
 --
--- Name: symbols_isin_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: symbols_isin_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX symbols_isin_idx ON public.symbols USING btree (isin) WHERE (isin IS NOT NULL);
 
 
 --
--- Name: tick_data_ticker_ts_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: tick_data_ticker_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX tick_data_ticker_ts_idx ON public.tick_data USING btree (ticker, ts);
 
 
 --
--- Name: trades_date_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: trades_date_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX trades_date_idx ON public.trades USING btree (trade_date);
 
 
 --
--- Name: trades_portfolio_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: trades_portfolio_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX trades_portfolio_idx ON public.trades USING btree (portfolio_id);
 
 
 --
--- Name: trades_ticker_idx; Type: INDEX; Schema: public; Owner: postgres
+-- Name: trades_ticker_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX trades_ticker_idx ON public.trades USING btree (ticker);
 
 
 --
--- Name: exchanges exchanges_touch; Type: TRIGGER; Schema: public; Owner: postgres
+-- Name: exchanges exchanges_touch; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER exchanges_touch BEFORE UPDATE ON public.exchanges FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
 
 
 --
--- Name: fundamentals fundamentals_touch; Type: TRIGGER; Schema: public; Owner: postgres
+-- Name: fundamentals fundamentals_touch; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER fundamentals_touch BEFORE UPDATE ON public.fundamentals FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
 
 
 --
--- Name: portfolios portfolios_touch; Type: TRIGGER; Schema: public; Owner: postgres
+-- Name: portfolios portfolios_touch; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER portfolios_touch BEFORE UPDATE ON public.portfolios FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
 
 
 --
--- Name: symbols symbols_touch; Type: TRIGGER; Schema: public; Owner: postgres
+-- Name: symbols symbols_touch; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER symbols_touch BEFORE UPDATE ON public.symbols FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
 
 
 --
--- Name: analyst_ratings_history analyst_ratings_history_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: analyst_ratings_history analyst_ratings_history_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.analyst_ratings_history
@@ -1599,7 +1471,7 @@ ALTER TABLE ONLY public.analyst_ratings_history
 
 
 --
--- Name: balance_sheets balance_sheets_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: balance_sheets balance_sheets_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.balance_sheets
@@ -1607,7 +1479,7 @@ ALTER TABLE ONLY public.balance_sheets
 
 
 --
--- Name: cash_flow_statements cash_flow_statements_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: cash_flow_statements cash_flow_statements_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.cash_flow_statements
@@ -1615,7 +1487,7 @@ ALTER TABLE ONLY public.cash_flow_statements
 
 
 --
--- Name: dividends dividends_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: dividends dividends_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.dividends
@@ -1623,7 +1495,7 @@ ALTER TABLE ONLY public.dividends
 
 
 --
--- Name: earnings_history earnings_history_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: earnings_history earnings_history_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.earnings_history
@@ -1631,7 +1503,7 @@ ALTER TABLE ONLY public.earnings_history
 
 
 --
--- Name: earnings_trend earnings_trend_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: earnings_trend earnings_trend_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.earnings_trend
@@ -1639,7 +1511,7 @@ ALTER TABLE ONLY public.earnings_trend
 
 
 --
--- Name: eod_prices eod_prices_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: eod_prices eod_prices_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.eod_prices
@@ -1647,7 +1519,7 @@ ALTER TABLE ONLY public.eod_prices
 
 
 --
--- Name: exchange_details exchange_details_exchange_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: exchange_details exchange_details_exchange_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.exchange_details
@@ -1655,7 +1527,7 @@ ALTER TABLE ONLY public.exchange_details
 
 
 --
--- Name: fund_holders fund_holders_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: fund_holders fund_holders_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.fund_holders
@@ -1663,7 +1535,7 @@ ALTER TABLE ONLY public.fund_holders
 
 
 --
--- Name: fundamentals fundamentals_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: fundamentals fundamentals_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.fundamentals
@@ -1671,7 +1543,7 @@ ALTER TABLE ONLY public.fundamentals
 
 
 --
--- Name: historical_market_cap historical_market_cap_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: historical_market_cap historical_market_cap_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.historical_market_cap
@@ -1679,7 +1551,7 @@ ALTER TABLE ONLY public.historical_market_cap
 
 
 --
--- Name: income_statements income_statements_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: income_statements income_statements_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.income_statements
@@ -1687,7 +1559,7 @@ ALTER TABLE ONLY public.income_statements
 
 
 --
--- Name: insider_transactions insider_transactions_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: insider_transactions insider_transactions_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.insider_transactions
@@ -1695,7 +1567,7 @@ ALTER TABLE ONLY public.insider_transactions
 
 
 --
--- Name: institutional_holders institutional_holders_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: institutional_holders institutional_holders_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.institutional_holders
@@ -1703,7 +1575,7 @@ ALTER TABLE ONLY public.institutional_holders
 
 
 --
--- Name: intraday_prices intraday_prices_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: intraday_prices intraday_prices_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.intraday_prices
@@ -1711,7 +1583,7 @@ ALTER TABLE ONLY public.intraday_prices
 
 
 --
--- Name: news news_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: news news_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.news
@@ -1719,7 +1591,7 @@ ALTER TABLE ONLY public.news
 
 
 --
--- Name: options_chains options_chains_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: options_chains options_chains_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.options_chains
@@ -1727,7 +1599,7 @@ ALTER TABLE ONLY public.options_chains
 
 
 --
--- Name: portfolios portfolios_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: portfolios portfolios_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.portfolios
@@ -1735,7 +1607,7 @@ ALTER TABLE ONLY public.portfolios
 
 
 --
--- Name: realtime_quotes realtime_quotes_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: realtime_quotes realtime_quotes_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.realtime_quotes
@@ -1743,7 +1615,7 @@ ALTER TABLE ONLY public.realtime_quotes
 
 
 --
--- Name: sentiment_daily sentiment_daily_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: sentiment_daily sentiment_daily_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.sentiment_daily
@@ -1751,7 +1623,7 @@ ALTER TABLE ONLY public.sentiment_daily
 
 
 --
--- Name: shares_outstanding shares_outstanding_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: shares_outstanding shares_outstanding_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.shares_outstanding
@@ -1759,7 +1631,7 @@ ALTER TABLE ONLY public.shares_outstanding
 
 
 --
--- Name: splits splits_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: splits splits_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.splits
@@ -1767,7 +1639,7 @@ ALTER TABLE ONLY public.splits
 
 
 --
--- Name: symbols symbols_exchange_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: symbols symbols_exchange_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.symbols
@@ -1775,7 +1647,7 @@ ALTER TABLE ONLY public.symbols
 
 
 --
--- Name: technical_indicators technical_indicators_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: technical_indicators technical_indicators_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.technical_indicators
@@ -1783,7 +1655,7 @@ ALTER TABLE ONLY public.technical_indicators
 
 
 --
--- Name: tick_data tick_data_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: tick_data tick_data_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.tick_data
@@ -1791,7 +1663,7 @@ ALTER TABLE ONLY public.tick_data
 
 
 --
--- Name: trades trades_portfolio_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: trades trades_portfolio_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.trades
@@ -1799,7 +1671,7 @@ ALTER TABLE ONLY public.trades
 
 
 --
--- Name: trades trades_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+-- Name: trades trades_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.trades
@@ -1810,5 +1682,5 @@ ALTER TABLE ONLY public.trades
 -- PostgreSQL database dump complete
 --
 
-\unrestrict fSWdgu8UmvUgcTUPMfCVLfZjHqoqHa3xJrUYk3JKhNYjnGtpARHPVmXGo7QGUVY
+\unrestrict EIMFcdFZoCyPFH1zHLwfq4L0ZIeUEt0LMCsZzKXl2mwn6iXNNSReQXQESqPKs6f
 
