@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict EIMFcdFZoCyPFH1zHLwfq4L0ZIeUEt0LMCsZzKXl2mwn6iXNNSReQXQESqPKs6f
+\restrict DNXS9lbKgkZGdyNb9WLkhOs7ifRDzgqbXv1H4AhEf0Os6vH7gaKnQLrTCs7cofc
 
 -- Dumped from database version 16.14 (Ubuntu 16.14-1.pgdg24.04+1)
 -- Dumped by pg_dump version 16.14 (Ubuntu 16.14-1.pgdg24.04+1)
@@ -19,14 +19,443 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
--- Name: public; Type: SCHEMA; Schema: -; Owner: -
+-- Name: btree_gin; Type: EXTENSION; Schema: -; Owner: -
 --
 
-CREATE SCHEMA public;
+CREATE EXTENSION IF NOT EXISTS btree_gin WITH SCHEMA public;
 
 
 --
--- Name: touch_updated_at(); Type: FUNCTION; Schema: public; Owner: -
+-- Name: EXTENSION btree_gin; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION btree_gin IS 'support for indexing common datatypes in GIN';
+
+
+--
+-- Name: pg_trgm; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pg_trgm; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
+
+
+--
+-- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pgcrypto; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
+
+
+--
+-- Name: build_newsletter(date); Type: FUNCTION; Schema: public; Owner: jon
+--
+
+CREATE FUNCTION public.build_newsletter(p_issue_date date DEFAULT CURRENT_DATE) RETURNS integer
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    v_count      integer;
+    v_price_asof date;
+    v_inst_asof  date;
+BEGIN
+    DELETE FROM newsletter_findings WHERE issue_date = p_issue_date;
+
+    SELECT max(as_of)        INTO v_price_asof FROM price_perf;
+    SELECT max(latest_filing) INTO v_inst_asof FROM inst_flow_ticker;
+
+    -- ================= provenance =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'provenance', 1, NULL,
+        format('Prices as of %s. Institutional positions reflect filings dated up to %s, %s days before publication.',
+               v_price_asof, v_inst_asof, (p_issue_date - v_inst_asof)),
+        jsonb_build_object(
+            'issue_date',             p_issue_date,
+            'price_as_of',            v_price_asof,
+            'institutional_as_of',    v_inst_asof,
+            'institutional_lag_days', (p_issue_date - v_inst_asof),
+            'universe_size',          (SELECT count(*) FROM price_perf),
+            'holders_universe_size',  (SELECT count(*) FROM inst_flow_ticker),
+            'analyst_ratings_rows',   (SELECT count(*) FROM analyst_ratings_history),
+            'holder_coverage_note',
+              'Holder data covers each ticker''s largest reported holders only, not every holder.',
+            'exit_note',
+              'Positions closed entirely are not reported by the data source and are not counted.'
+        );
+
+    -- ================= market_breadth =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'market_breadth', 1, NULL,
+        format('Of %s liquid names in the covered universe, %s advanced and %s declined; median move %s%%.',
+               b.total, b.advancers, b.decliners, b.median_ret_1d),
+        jsonb_build_object(
+            'scope',        'institutional-holdings universe, liquidity-filtered',
+            'scope_caveat', 'This is not an index. It is a breadth measure over covered names.',
+            'as_of', v_price_asof,
+            'total', b.total, 'advancers', b.advancers, 'decliners', b.decliners,
+            'unchanged', b.unchanged, 'advance_decline_ratio', b.ad_ratio,
+            'median_ret_1d', b.median_ret_1d, 'median_ret_5d', b.median_ret_5d,
+            'median_ret_1m', b.median_ret_1m, 'pct_above_zero_12m', b.pct_pos_12m)
+    FROM (
+        SELECT count(*) AS total,
+            count(*) FILTER (WHERE ret_1d > 0) AS advancers,
+            count(*) FILTER (WHERE ret_1d < 0) AS decliners,
+            count(*) FILTER (WHERE ret_1d = 0) AS unchanged,
+            CASE WHEN count(*) FILTER (WHERE ret_1d < 0) = 0 THEN NULL
+                 ELSE round(count(*) FILTER (WHERE ret_1d > 0)::numeric
+                          / count(*) FILTER (WHERE ret_1d < 0), 2) END AS ad_ratio,
+            round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ret_1d)::numeric, 2) AS median_ret_1d,
+            round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ret_5d)::numeric, 2) AS median_ret_5d,
+            round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ret_1m)::numeric, 2) AS median_ret_1m,
+            round(100.0 * count(*) FILTER (WHERE ret_12m > 0)
+                  / NULLIF(count(*) FILTER (WHERE ret_12m IS NOT NULL), 0), 1) AS pct_pos_12m
+        FROM price_perf
+        WHERE ret_1d IS NOT NULL
+          AND close >= cfg('min_price') AND avg_vol_20d >= cfg('min_avg_vol_20d')
+    ) b
+    WHERE b.total > 0;
+
+    -- ================= movers_up =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'movers_up',
+        row_number() OVER (ORDER BY p.ret_1d DESC), p.ticker,
+        format('%s (%s) +%s%% on %sx average volume.',
+               COALESCE(f.name, p.ticker), p.ticker, p.ret_1d, COALESCE(p.vol_ratio, 0)),
+        jsonb_build_object('ticker', p.ticker, 'name', f.name, 'sector', f.sector,
+            'as_of', p.as_of, 'close', p.close, 'ret_1d', p.ret_1d, 'ret_5d', p.ret_5d,
+            'ret_1m', p.ret_1m, 'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'volume', p.volume, 'avg_vol_20d', p.avg_vol_20d, 'vol_ratio', p.vol_ratio,
+            'market_cap', f.market_cap)
+    FROM price_perf p
+    LEFT JOIN fundamentals f ON f.ticker = p.ticker
+    WHERE p.ret_1d > 0                 -- empty section beats a mislabelled one
+      AND p.close >= cfg('min_price') AND p.avg_vol_20d >= cfg('min_avg_vol_20d')
+    ORDER BY p.ret_1d DESC LIMIT cfg('top_n')::int;
+
+    -- ================= movers_down =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'movers_down',
+        row_number() OVER (ORDER BY p.ret_1d ASC), p.ticker,
+        format('%s (%s) %s%% on %sx average volume.',
+               COALESCE(f.name, p.ticker), p.ticker, p.ret_1d, COALESCE(p.vol_ratio, 0)),
+        jsonb_build_object('ticker', p.ticker, 'name', f.name, 'sector', f.sector,
+            'as_of', p.as_of, 'close', p.close, 'ret_1d', p.ret_1d, 'ret_5d', p.ret_5d,
+            'ret_1m', p.ret_1m, 'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'volume', p.volume, 'avg_vol_20d', p.avg_vol_20d, 'vol_ratio', p.vol_ratio,
+            'market_cap', f.market_cap)
+    FROM price_perf p
+    LEFT JOIN fundamentals f ON f.ticker = p.ticker
+    WHERE p.ret_1d < 0
+      AND p.close >= cfg('min_price') AND p.avg_vol_20d >= cfg('min_avg_vol_20d')
+    ORDER BY p.ret_1d ASC LIMIT cfg('top_n')::int;
+
+    -- ================= inst_accumulation =================
+    -- Reads EODHD's own per-holder change. No exit counts: unobservable.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'inst_accumulation',
+        row_number() OVER (ORDER BY t.net_change_pct DESC), t.ticker,
+        format('%s (%s): reported institutional share count rose %s%% at the %s filing date. %s holders added, %s initiated new positions, %s left unchanged.',
+               COALESCE(f.name, t.ticker), t.ticker, t.net_change_pct,
+               t.latest_filing, t.n_added, t.n_initiated, t.n_unchanged),
+        jsonb_build_object(
+            'ticker', t.ticker, 'name', f.name, 'sector', f.sector,
+            'latest_filing', t.latest_filing,
+            'holders_at_latest', t.holders_at_latest,
+            'holders_lagging',   t.holders_lagging,
+            'net_change_shares', t.net_change_shares,
+            'net_change_pct',    t.net_change_pct,
+            'prior_shares_at_latest', t.prior_shares_at_latest,
+            'top_n_holders', t.top_n_holders,
+            'top_n_pct_of_shares_out', t.top_n_pct_of_shares_out,
+            'top_n_at_cap', t.top_n_at_cap,
+            'coverage_note', 'Covers the largest reported holders only. Not total institutional ownership.',
+            'bias_note', 'Where the holder list is capped, holders that exited or fell out of the largest-holder list are not reported, so reductions are undercounted. This figure understates selling.',
+            'n_added', t.n_added, 'n_trimmed', t.n_trimmed,
+            'n_initiated', t.n_initiated, 'n_unchanged', t.n_unchanged,
+            'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'top_movers', (
+                SELECT jsonb_agg(x) FROM (
+                    SELECT jsonb_build_object('holder', i.holder_name, 'action', i.action,
+                        'change_shares', i.change_shares, 'change_pct', i.change_pct_clean,
+                        'shares_held', i.shares_held,
+                        'pct_of_holder_portfolio', i.pct_assets) AS x
+                    FROM inst_flow i
+                    WHERE i.ticker = t.ticker AND i.report_date = t.latest_filing
+                      AND i.action IN ('added','initiated')
+                    ORDER BY i.change_shares DESC LIMIT 3
+                ) s))
+    FROM inst_flow_ticker t
+    LEFT JOIN fundamentals f ON f.ticker = t.ticker
+    LEFT JOIN price_perf   p ON p.ticker = t.ticker
+    WHERE t.net_change_pct IS NOT NULL
+      AND t.top_n_holders          >= cfg('min_holders')
+      AND t.holders_at_latest      >= cfg('min_holders_at_latest')
+      AND t.prior_shares_at_latest >= cfg('min_prior_shares')
+    ORDER BY t.net_change_pct DESC LIMIT cfg('top_n')::int;
+
+    -- ================= inst_distribution =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'inst_distribution',
+        row_number() OVER (ORDER BY t.net_change_pct ASC), t.ticker,
+        format('%s (%s): reported institutional share count fell %s%% at the %s filing date. %s holders trimmed, %s added, %s left unchanged.',
+               COALESCE(f.name, t.ticker), t.ticker, abs(t.net_change_pct),
+               t.latest_filing, t.n_trimmed, t.n_added, t.n_unchanged),
+        jsonb_build_object(
+            'ticker', t.ticker, 'name', f.name, 'sector', f.sector,
+            'latest_filing', t.latest_filing,
+            'holders_at_latest', t.holders_at_latest,
+            'holders_lagging',   t.holders_lagging,
+            'net_change_shares', t.net_change_shares,
+            'net_change_pct',    t.net_change_pct,
+            'prior_shares_at_latest', t.prior_shares_at_latest,
+            'top_n_holders', t.top_n_holders,
+            'top_n_pct_of_shares_out', t.top_n_pct_of_shares_out,
+            'top_n_at_cap', t.top_n_at_cap,
+            'coverage_note', 'Covers the largest reported holders only. Positions closed entirely are not reported.',
+            'bias_note', 'This is a lower bound on selling. Holders that exited or fell out of the largest-holder list are not reported, so the actual reduction is at least this large and probably larger.',
+            'n_added', t.n_added, 'n_trimmed', t.n_trimmed,
+            'n_initiated', t.n_initiated, 'n_unchanged', t.n_unchanged,
+            'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'top_movers', (
+                SELECT jsonb_agg(x) FROM (
+                    SELECT jsonb_build_object('holder', i.holder_name, 'action', i.action,
+                        'change_shares', i.change_shares, 'change_pct', i.change_pct_clean,
+                        'shares_held', i.shares_held,
+                        'pct_of_holder_portfolio', i.pct_assets) AS x
+                    FROM inst_flow i
+                    WHERE i.ticker = t.ticker AND i.report_date = t.latest_filing
+                      AND i.action = 'trimmed'
+                    ORDER BY i.change_shares ASC LIMIT 3
+                ) s))
+    FROM inst_flow_ticker t
+    LEFT JOIN fundamentals f ON f.ticker = t.ticker
+    LEFT JOIN price_perf   p ON p.ticker = t.ticker
+    WHERE t.net_change_pct IS NOT NULL
+      AND t.top_n_holders          >= cfg('min_holders')
+      AND t.holders_at_latest      >= cfg('min_holders_at_latest')
+      AND t.prior_shares_at_latest >= cfg('min_prior_shares')
+    ORDER BY t.net_change_pct ASC LIMIT cfg('top_n')::int;
+
+    -- ================= inst_ownership =================
+    -- NEW in rev 2. Concentration and conviction. Needs no history, no
+    -- deltas, no snapshots. Works at launch and is not affected by any
+    -- of the four data traps except top-N truncation, which is labelled.
+    --
+    -- pct_assets = share of the HOLDER's own portfolio in this name.
+    -- A high value is a conviction signal and is cross-sectional, not
+    -- temporal, so it is immune to the whole snapshot problem.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'inst_ownership',
+        row_number() OVER (ORDER BY t.max_holder_conviction_pct DESC), t.ticker,
+        format('%s (%s): %s reported institutional holders; largest holds %s%% of shares outstanding. One holder allocates %s%% of its own portfolio to the position.',
+               COALESCE(f.name, t.ticker), t.ticker, t.top_n_holders,
+               t.largest_holder_pct, t.max_holder_conviction_pct),
+        jsonb_build_object(
+            'ticker', t.ticker, 'name', f.name, 'sector', f.sector,
+            'latest_filing', t.latest_filing,
+            'top_n_holders', t.top_n_holders,
+            'top_n_pct_of_shares_out', t.top_n_pct_of_shares_out,
+            'largest_holder_pct', t.largest_holder_pct,
+            'max_holder_conviction_pct', t.max_holder_conviction_pct,
+            'top_n_at_cap', t.top_n_at_cap,
+            'coverage_note', 'Covers the largest reported holders only, not every institutional holder.',
+            'conviction_selection_note', 'The largest-holder list is ranked by position size, not by conviction. A small holder with a very concentrated position may be absent. This is the most concentrated among reported holders, not necessarily overall.',
+            'conviction_note', 'Portfolio allocation is the share of that holder''s own reported portfolio in this security.',
+            'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'most_concentrated', (
+                SELECT jsonb_agg(x) FROM (
+                    SELECT jsonb_build_object('holder', i.holder_name,
+                        'pct_of_holder_portfolio', i.pct_assets,
+                        'pct_of_shares_out', i.pct_shares,
+                        'shares_held', i.shares_held) AS x
+                    FROM inst_flow i
+                    WHERE i.ticker = t.ticker AND i.pct_assets IS NOT NULL
+                    ORDER BY i.pct_assets DESC LIMIT 3
+                ) s))
+    FROM inst_flow_ticker t
+    LEFT JOIN fundamentals f ON f.ticker = t.ticker
+    LEFT JOIN price_perf   p ON p.ticker = t.ticker
+    WHERE t.max_holder_conviction_pct IS NOT NULL
+      AND t.top_n_holders >= cfg('min_holders')
+    ORDER BY t.max_holder_conviction_pct DESC LIMIT cfg('top_n')::int;
+
+    -- ================= fund_flow_notable =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'fund_flow_notable',
+        row_number() OVER (ORDER BY abs(t.net_change_pct) DESC), t.ticker,
+        format('%s (%s): fund-held shares %s %s%% across %s reported funds filing between %s and %s.',
+               COALESCE(f.name, t.ticker), t.ticker,
+               CASE WHEN t.net_change_pct >= 0 THEN 'rose' ELSE 'fell' END,
+               abs(t.net_change_pct), t.funds_in_window,
+               t.window_earliest_filing, t.latest_filing),
+        jsonb_build_object('ticker', t.ticker, 'name', f.name, 'sector', f.sector,
+            'latest_filing', t.latest_filing,
+            'window_earliest_filing', t.window_earliest_filing,
+            'filing_span_days', t.filing_span_days,
+            'top_n_funds', t.top_n_funds,
+            'funds_in_window', t.funds_in_window, 'funds_stale', t.funds_stale,
+            'net_change_shares', t.net_change_shares,
+            'net_change_pct', t.net_change_pct,
+            'prior_shares_in_window', t.prior_shares_in_window,
+            'top_n_pct_of_shares_out', t.top_n_pct_of_shares_out,
+            'coverage_note', 'Covers the largest reported fund holders only.',
+            'asynchrony_note', 'Funds report on staggered month-ends. Each change is measured against that fund''s own prior report, so this aggregates across different reporting periods.',
+            'n_initiated', t.n_initiated, 'n_added', t.n_added, 'n_trimmed', t.n_trimmed)
+    FROM fund_flow_ticker t
+    LEFT JOIN fundamentals f ON f.ticker = t.ticker
+    WHERE t.net_change_pct IS NOT NULL
+      AND t.top_n_funds            >= cfg('min_holders')
+      AND t.funds_in_window        >= 3
+      AND t.prior_shares_in_window >= cfg('min_prior_shares')
+    ORDER BY abs(t.net_change_pct) DESC LIMIT cfg('top_n')::int;
+
+    -- ================= insider_activity =================
+    -- Codes P and S only. A/M/G are grants, option exercises and gifts:
+    -- compensation events, not conviction.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'insider_activity',
+        row_number() OVER (ORDER BY abs(agg.net_value) DESC), agg.ticker,
+        format('%s (%s): %s open-market insider %s across %s %s over the last 30 days, net %s of $%s.',
+               COALESCE(f.name, agg.ticker), agg.ticker, agg.n_txns,
+               CASE WHEN agg.n_txns = 1 THEN 'transaction' ELSE 'transactions' END,
+               agg.n_insiders,
+               CASE WHEN agg.n_insiders = 1 THEN 'insider' ELSE 'insiders' END,
+               CASE WHEN agg.net_value >= 0 THEN 'buying' ELSE 'selling' END,
+               to_char(abs(agg.net_value), 'FM999,999,999,990')),
+        jsonb_build_object('ticker', agg.ticker, 'name', f.name, 'sector', f.sector,
+            'window_days', 30, 'n_txns', agg.n_txns,
+            'n_buys', agg.n_buys, 'n_sells', agg.n_sells, 'n_insiders', agg.n_insiders,
+            'buy_value', agg.buy_value, 'sell_value', agg.sell_value,
+            'net_value', agg.net_value, 'earliest', agg.earliest, 'latest', agg.latest)
+    FROM (
+        SELECT it.ticker, count(*) AS n_txns,
+            count(*) FILTER (WHERE it.transaction_code='P') AS n_buys,
+            count(*) FILTER (WHERE it.transaction_code='S') AS n_sells,
+            count(DISTINCT it.owner_name) AS n_insiders,
+            COALESCE(sum(it.value) FILTER (WHERE it.transaction_code='P'),0) AS buy_value,
+            COALESCE(sum(it.value) FILTER (WHERE it.transaction_code='S'),0) AS sell_value,
+            COALESCE(sum(it.value) FILTER (WHERE it.transaction_code='P'),0)
+              - COALESCE(sum(it.value) FILTER (WHERE it.transaction_code='S'),0) AS net_value,
+            min(it.transaction_date) AS earliest, max(it.transaction_date) AS latest
+        FROM insider_transactions it
+        WHERE it.transaction_code IN ('P','S')
+          AND it.transaction_date >= (p_issue_date - INTERVAL '30 days')
+          AND it.value IS NOT NULL
+        GROUP BY it.ticker HAVING count(*) >= 2
+    ) agg
+    LEFT JOIN fundamentals f ON f.ticker = agg.ticker
+    ORDER BY abs(agg.net_value) DESC LIMIT cfg('top_n')::int;
+
+    -- ================= analyst_consensus =================
+    -- Empty until the flatten cron has run on two distinct dates.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'analyst_consensus',
+        row_number() OVER (ORDER BY abs(d.drift) DESC), d.ticker,
+        format('%s (%s): consensus rating moved from %s to %s between %s and %s (scale: 5 = strong buy).',
+               COALESCE(f.name, d.ticker), d.ticker, d.prev_rating, d.curr_rating,
+               d.prev_date, d.curr_date),
+        jsonb_build_object('ticker', d.ticker, 'name', f.name, 'sector', f.sector,
+            'scale_note', '5 = strong buy, 1 = strong sell. Rising rating = improving consensus.',
+            'curr_date', d.curr_date, 'prev_date', d.prev_date,
+            'curr_rating', d.curr_rating, 'prev_rating', d.prev_rating, 'drift', d.drift,
+            'curr_target_price', d.curr_target, 'prev_target_price', d.prev_target,
+            'close', p.close,
+            'target_vs_close_pct',
+                CASE WHEN p.close > 0 THEN round((d.curr_target/p.close - 1)*100.0, 2) END,
+            'strong_buy', d.strong_buy, 'buy', d.buy, 'hold', d.hold,
+            'sell', d.sell, 'strong_sell', d.strong_sell)
+    FROM (
+        SELECT c.ticker, c.date AS curr_date, pr.date AS prev_date,
+            c.rating AS curr_rating, pr.rating AS prev_rating,
+            round(c.rating - pr.rating, 4) AS drift,
+            c.target_price AS curr_target, pr.target_price AS prev_target,
+            c.strong_buy, c.buy, c.hold, c.sell, c.strong_sell
+        FROM (SELECT DISTINCT ON (ticker) * FROM analyst_ratings_history
+              WHERE rating IS NOT NULL ORDER BY ticker, date DESC) c
+        JOIN LATERAL (
+            SELECT * FROM analyst_ratings_history a
+            WHERE a.ticker = c.ticker AND a.date < c.date AND a.rating IS NOT NULL
+            ORDER BY a.date DESC LIMIT 1) pr ON true
+        WHERE abs(c.rating - pr.rating) >= 0.05
+    ) d
+    LEFT JOIN fundamentals f ON f.ticker = d.ticker
+    LEFT JOIN price_perf   p ON p.ticker = d.ticker
+    ORDER BY abs(d.drift) DESC LIMIT cfg('top_n')::int;
+
+    SELECT count(*) INTO v_count FROM newsletter_findings WHERE issue_date = p_issue_date;
+    RETURN v_count;
+END;
+$_$;
+
+
+ALTER FUNCTION public.build_newsletter(p_issue_date date) OWNER TO jon;
+
+--
+-- Name: cfg(text); Type: FUNCTION; Schema: public; Owner: jon
+--
+
+CREATE FUNCTION public.cfg(p_key text) RETURNS numeric
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT value FROM newsletter_config WHERE key = p_key;
+$$;
+
+
+ALTER FUNCTION public.cfg(p_key text) OWNER TO jon;
+
+--
+-- Name: newsletter_payload(date); Type: FUNCTION; Schema: public; Owner: jon
+--
+
+CREATE FUNCTION public.newsletter_payload(p_issue_date date DEFAULT CURRENT_DATE) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT jsonb_object_agg(section, items)
+    FROM (
+        SELECT section,
+               jsonb_agg(jsonb_build_object('rank', rank, 'headline', headline, 'facts', facts)
+                         ORDER BY rank) AS items
+        FROM newsletter_findings WHERE issue_date = p_issue_date GROUP BY section
+    ) s;
+$$;
+
+
+ALTER FUNCTION public.newsletter_payload(p_issue_date date) OWNER TO jon;
+
+--
+-- Name: refresh_metrics(); Type: FUNCTION; Schema: public; Owner: jon
+--
+
+CREATE FUNCTION public.refresh_metrics() RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY inst_flow;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY fund_flow;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY inst_flow_ticker;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY fund_flow_ticker;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY price_perf;
+END;
+$$;
+
+
+ALTER FUNCTION public.refresh_metrics() OWNER TO jon;
+
+--
+-- Name: touch_updated_at(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
 CREATE FUNCTION public.touch_updated_at() RETURNS trigger
@@ -39,12 +468,14 @@ END;
 $$;
 
 
+ALTER FUNCTION public.touch_updated_at() OWNER TO postgres;
+
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
 
 --
--- Name: analyst_ratings_history; Type: TABLE; Schema: public; Owner: -
+-- Name: analyst_ratings_history; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.analyst_ratings_history (
@@ -60,8 +491,10 @@ CREATE TABLE public.analyst_ratings_history (
 );
 
 
+ALTER TABLE public.analyst_ratings_history OWNER TO postgres;
+
 --
--- Name: balance_sheets; Type: TABLE; Schema: public; Owner: -
+-- Name: balance_sheets; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.balance_sheets (
@@ -87,8 +520,10 @@ CREATE TABLE public.balance_sheets (
 );
 
 
+ALTER TABLE public.balance_sheets OWNER TO postgres;
+
 --
--- Name: bond_fundamentals; Type: TABLE; Schema: public; Owner: -
+-- Name: bond_fundamentals; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.bond_fundamentals (
@@ -104,8 +539,10 @@ CREATE TABLE public.bond_fundamentals (
 );
 
 
+ALTER TABLE public.bond_fundamentals OWNER TO postgres;
+
 --
--- Name: cash_flow_statements; Type: TABLE; Schema: public; Owner: -
+-- Name: cash_flow_statements; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.cash_flow_statements (
@@ -126,8 +563,10 @@ CREATE TABLE public.cash_flow_statements (
 );
 
 
+ALTER TABLE public.cash_flow_statements OWNER TO postgres;
+
 --
--- Name: dividends; Type: TABLE; Schema: public; Owner: -
+-- Name: dividends; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.dividends (
@@ -143,8 +582,10 @@ CREATE TABLE public.dividends (
 );
 
 
+ALTER TABLE public.dividends OWNER TO postgres;
+
 --
--- Name: earnings_calendar; Type: TABLE; Schema: public; Owner: -
+-- Name: earnings_calendar; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.earnings_calendar (
@@ -160,8 +601,10 @@ CREATE TABLE public.earnings_calendar (
 );
 
 
+ALTER TABLE public.earnings_calendar OWNER TO postgres;
+
 --
--- Name: earnings_history; Type: TABLE; Schema: public; Owner: -
+-- Name: earnings_history; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.earnings_history (
@@ -177,8 +620,10 @@ CREATE TABLE public.earnings_history (
 );
 
 
+ALTER TABLE public.earnings_history OWNER TO postgres;
+
 --
--- Name: earnings_trend; Type: TABLE; Schema: public; Owner: -
+-- Name: earnings_trend; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.earnings_trend (
@@ -195,8 +640,10 @@ CREATE TABLE public.earnings_trend (
 );
 
 
+ALTER TABLE public.earnings_trend OWNER TO postgres;
+
 --
--- Name: economic_events; Type: TABLE; Schema: public; Owner: -
+-- Name: economic_events; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.economic_events (
@@ -214,8 +661,10 @@ CREATE TABLE public.economic_events (
 );
 
 
+ALTER TABLE public.economic_events OWNER TO postgres;
+
 --
--- Name: economic_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: economic_events_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.economic_events_id_seq
@@ -226,15 +675,17 @@ CREATE SEQUENCE public.economic_events_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.economic_events_id_seq OWNER TO postgres;
+
 --
--- Name: economic_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: economic_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.economic_events_id_seq OWNED BY public.economic_events.id;
 
 
 --
--- Name: eod_prices; Type: TABLE; Schema: public; Owner: -
+-- Name: eod_prices; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.eod_prices (
@@ -249,8 +700,10 @@ CREATE TABLE public.eod_prices (
 );
 
 
+ALTER TABLE public.eod_prices OWNER TO postgres;
+
 --
--- Name: exchange_details; Type: TABLE; Schema: public; Owner: -
+-- Name: exchange_details; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.exchange_details (
@@ -263,8 +716,10 @@ CREATE TABLE public.exchange_details (
 );
 
 
+ALTER TABLE public.exchange_details OWNER TO postgres;
+
 --
--- Name: exchanges; Type: TABLE; Schema: public; Owner: -
+-- Name: exchanges; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.exchanges (
@@ -279,8 +734,10 @@ CREATE TABLE public.exchanges (
 );
 
 
+ALTER TABLE public.exchanges OWNER TO postgres;
+
 --
--- Name: fund_holders; Type: TABLE; Schema: public; Owner: -
+-- Name: fund_holders; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.fund_holders (
@@ -288,12 +745,88 @@ CREATE TABLE public.fund_holders (
     holder_name text NOT NULL,
     report_date date NOT NULL,
     pct_shares numeric(10,6),
-    shares_held numeric(20,2)
+    shares_held numeric(20,2),
+    change_shares numeric(20,2),
+    change_pct numeric(14,4),
+    observed_at date
 );
 
 
+ALTER TABLE public.fund_holders OWNER TO postgres;
+
 --
--- Name: fundamentals; Type: TABLE; Schema: public; Owner: -
+-- Name: fund_flow; Type: MATERIALIZED VIEW; Schema: public; Owner: jon
+--
+
+CREATE MATERIALIZED VIEW public.fund_flow AS
+ SELECT ticker,
+    holder_name,
+    report_date,
+    observed_at,
+    shares_held,
+    pct_shares,
+    change_shares,
+    change_pct,
+    (shares_held - change_shares) AS prior_shares,
+        CASE
+            WHEN ((change_shares = shares_held) AND (change_shares <> (0)::numeric)) THEN 'initiated'::text
+            WHEN (change_shares = (0)::numeric) THEN 'unchanged'::text
+            WHEN (change_shares > (0)::numeric) THEN 'added'::text
+            WHEN (change_shares < (0)::numeric) THEN 'trimmed'::text
+            ELSE NULL::text
+        END AS action,
+        CASE
+            WHEN ((change_shares = shares_held) AND (change_shares <> (0)::numeric)) THEN NULL::numeric
+            ELSE change_pct
+        END AS change_pct_clean
+   FROM public.fund_holders h
+  WHERE (change_shares IS NOT NULL)
+  WITH NO DATA;
+
+
+ALTER MATERIALIZED VIEW public.fund_flow OWNER TO jon;
+
+--
+-- Name: fund_flow_ticker; Type: MATERIALIZED VIEW; Schema: public; Owner: jon
+--
+
+CREATE MATERIALIZED VIEW public.fund_flow_ticker AS
+ WITH bounds AS (
+         SELECT fund_flow.ticker,
+            max(fund_flow.report_date) AS latest_filing,
+            (max(fund_flow.report_date) - 95) AS window_start
+           FROM public.fund_flow
+          GROUP BY fund_flow.ticker
+        )
+ SELECT f.ticker,
+    b.latest_filing,
+    min(f.report_date) FILTER (WHERE (f.report_date >= b.window_start)) AS window_earliest_filing,
+    (b.latest_filing - min(f.report_date) FILTER (WHERE (f.report_date >= b.window_start))) AS filing_span_days,
+    max(f.observed_at) AS observed_at,
+    count(*) AS top_n_funds,
+    count(*) FILTER (WHERE (f.report_date >= b.window_start)) AS funds_in_window,
+    count(*) FILTER (WHERE (f.report_date < b.window_start)) AS funds_stale,
+    sum(f.shares_held) AS top_n_shares,
+    round(sum(f.pct_shares), 4) AS top_n_pct_of_shares_out,
+    sum(f.change_shares) FILTER (WHERE (f.report_date >= b.window_start)) AS net_change_shares,
+    sum((f.shares_held - f.change_shares)) FILTER (WHERE (f.report_date >= b.window_start)) AS prior_shares_in_window,
+        CASE
+            WHEN (sum((f.shares_held - f.change_shares)) FILTER (WHERE (f.report_date >= b.window_start)) > (0)::numeric) THEN round(((sum(f.change_shares) FILTER (WHERE (f.report_date >= b.window_start)) / sum((f.shares_held - f.change_shares)) FILTER (WHERE (f.report_date >= b.window_start))) * 100.0), 2)
+            ELSE NULL::numeric
+        END AS net_change_pct,
+    count(*) FILTER (WHERE ((f.action = 'initiated'::text) AND (f.report_date >= b.window_start))) AS n_initiated,
+    count(*) FILTER (WHERE ((f.action = 'added'::text) AND (f.report_date >= b.window_start))) AS n_added,
+    count(*) FILTER (WHERE ((f.action = 'trimmed'::text) AND (f.report_date >= b.window_start))) AS n_trimmed
+   FROM (public.fund_flow f
+     JOIN bounds b ON ((b.ticker = f.ticker)))
+  GROUP BY f.ticker, b.latest_filing, b.window_start
+  WITH NO DATA;
+
+
+ALTER MATERIALIZED VIEW public.fund_flow_ticker OWNER TO jon;
+
+--
+-- Name: fundamentals; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.fundamentals (
@@ -353,8 +886,10 @@ CREATE TABLE public.fundamentals (
 );
 
 
+ALTER TABLE public.fundamentals OWNER TO postgres;
+
 --
--- Name: historical_market_cap; Type: TABLE; Schema: public; Owner: -
+-- Name: historical_market_cap; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.historical_market_cap (
@@ -364,8 +899,10 @@ CREATE TABLE public.historical_market_cap (
 );
 
 
+ALTER TABLE public.historical_market_cap OWNER TO postgres;
+
 --
--- Name: income_statements; Type: TABLE; Schema: public; Owner: -
+-- Name: income_statements; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.income_statements (
@@ -391,8 +928,10 @@ CREATE TABLE public.income_statements (
 );
 
 
+ALTER TABLE public.income_statements OWNER TO postgres;
+
 --
--- Name: index_constituents; Type: TABLE; Schema: public; Owner: -
+-- Name: index_constituents; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.index_constituents (
@@ -408,8 +947,10 @@ CREATE TABLE public.index_constituents (
 );
 
 
+ALTER TABLE public.index_constituents OWNER TO postgres;
+
 --
--- Name: ingest_log; Type: TABLE; Schema: public; Owner: -
+-- Name: ingest_log; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.ingest_log (
@@ -425,8 +966,10 @@ CREATE TABLE public.ingest_log (
 );
 
 
+ALTER TABLE public.ingest_log OWNER TO postgres;
+
 --
--- Name: ingest_log_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: ingest_log_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.ingest_log_id_seq
@@ -437,15 +980,17 @@ CREATE SEQUENCE public.ingest_log_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.ingest_log_id_seq OWNER TO postgres;
+
 --
--- Name: ingest_log_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: ingest_log_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.ingest_log_id_seq OWNED BY public.ingest_log.id;
 
 
 --
--- Name: insider_transactions; Type: TABLE; Schema: public; Owner: -
+-- Name: insider_transactions; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.insider_transactions (
@@ -458,12 +1003,30 @@ CREATE TABLE public.insider_transactions (
     acquisition_or_disposition text,
     shares numeric(20,2) NOT NULL,
     price numeric(18,4),
-    value numeric(24,2)
+    value numeric(24,2),
+    report_date date,
+    owner_title text
 );
 
 
+ALTER TABLE public.insider_transactions OWNER TO postgres;
+
 --
--- Name: institutional_holders; Type: TABLE; Schema: public; Owner: -
+-- Name: COLUMN insider_transactions.report_date; Type: COMMENT; Schema: public; Owner: postgres
+--
+
+COMMENT ON COLUMN public.insider_transactions.report_date IS 'SEC Form 4 filing/acceptance date (knowability date); from the dedicated insider endpoint';
+
+
+--
+-- Name: COLUMN insider_transactions.owner_title; Type: COMMENT; Schema: public; Owner: postgres
+--
+
+COMMENT ON COLUMN public.insider_transactions.owner_title IS 'Reporting owner title/role, e.g. CEO/Director; from the dedicated insider endpoint';
+
+
+--
+-- Name: institutional_holders; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.institutional_holders (
@@ -472,12 +1035,91 @@ CREATE TABLE public.institutional_holders (
     report_date date NOT NULL,
     pct_shares numeric(10,6),
     pct_assets numeric(10,6),
-    shares_held numeric(20,2)
+    shares_held numeric(20,2),
+    change_shares numeric(20,2),
+    change_pct numeric(14,4),
+    observed_at date
 );
 
 
+ALTER TABLE public.institutional_holders OWNER TO postgres;
+
 --
--- Name: intraday_prices; Type: TABLE; Schema: public; Owner: -
+-- Name: inst_flow; Type: MATERIALIZED VIEW; Schema: public; Owner: jon
+--
+
+CREATE MATERIALIZED VIEW public.inst_flow AS
+ SELECT ticker,
+    holder_name,
+    report_date,
+    observed_at,
+    shares_held,
+    pct_shares,
+    pct_assets,
+    change_shares,
+    change_pct,
+    (shares_held - change_shares) AS prior_shares,
+        CASE
+            WHEN ((change_shares = shares_held) AND (change_shares <> (0)::numeric)) THEN 'initiated'::text
+            WHEN (change_shares = (0)::numeric) THEN 'unchanged'::text
+            WHEN (change_shares > (0)::numeric) THEN 'added'::text
+            WHEN (change_shares < (0)::numeric) THEN 'trimmed'::text
+            ELSE NULL::text
+        END AS action,
+        CASE
+            WHEN ((change_shares = shares_held) AND (change_shares <> (0)::numeric)) THEN NULL::numeric
+            ELSE change_pct
+        END AS change_pct_clean
+   FROM public.institutional_holders h
+  WHERE (change_shares IS NOT NULL)
+  WITH NO DATA;
+
+
+ALTER MATERIALIZED VIEW public.inst_flow OWNER TO jon;
+
+--
+-- Name: inst_flow_ticker; Type: MATERIALIZED VIEW; Schema: public; Owner: jon
+--
+
+CREATE MATERIALIZED VIEW public.inst_flow_ticker AS
+ WITH latest AS (
+         SELECT inst_flow.ticker,
+            max(inst_flow.report_date) AS latest_filing
+           FROM public.inst_flow
+          GROUP BY inst_flow.ticker
+        )
+ SELECT f.ticker,
+    l.latest_filing,
+    min(f.report_date) AS earliest_filing,
+    max(f.observed_at) AS observed_at,
+    count(*) AS top_n_holders,
+    (count(*) >= 20) AS top_n_at_cap,
+    count(*) FILTER (WHERE (f.report_date = l.latest_filing)) AS holders_at_latest,
+    count(*) FILTER (WHERE (f.report_date <> l.latest_filing)) AS holders_lagging,
+    sum(f.shares_held) AS top_n_shares,
+    round(sum(f.pct_shares), 4) AS top_n_pct_of_shares_out,
+    round(max(f.pct_shares), 4) AS largest_holder_pct,
+    round(max(f.pct_assets), 4) AS max_holder_conviction_pct,
+    sum(f.change_shares) FILTER (WHERE (f.report_date = l.latest_filing)) AS net_change_shares,
+    sum((f.shares_held - f.change_shares)) FILTER (WHERE (f.report_date = l.latest_filing)) AS prior_shares_at_latest,
+        CASE
+            WHEN (sum((f.shares_held - f.change_shares)) FILTER (WHERE (f.report_date = l.latest_filing)) > (0)::numeric) THEN round(((sum(f.change_shares) FILTER (WHERE (f.report_date = l.latest_filing)) / sum((f.shares_held - f.change_shares)) FILTER (WHERE (f.report_date = l.latest_filing))) * 100.0), 2)
+            ELSE NULL::numeric
+        END AS net_change_pct,
+    count(*) FILTER (WHERE ((f.action = 'added'::text) AND (f.report_date = l.latest_filing))) AS n_added,
+    count(*) FILTER (WHERE ((f.action = 'trimmed'::text) AND (f.report_date = l.latest_filing))) AS n_trimmed,
+    count(*) FILTER (WHERE ((f.action = 'initiated'::text) AND (f.report_date = l.latest_filing))) AS n_initiated,
+    count(*) FILTER (WHERE ((f.action = 'unchanged'::text) AND (f.report_date = l.latest_filing))) AS n_unchanged
+   FROM (public.inst_flow f
+     JOIN latest l ON ((l.ticker = f.ticker)))
+  GROUP BY f.ticker, l.latest_filing
+  WITH NO DATA;
+
+
+ALTER MATERIALIZED VIEW public.inst_flow_ticker OWNER TO jon;
+
+--
+-- Name: intraday_prices; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.intraday_prices (
@@ -492,8 +1134,10 @@ CREATE TABLE public.intraday_prices (
 );
 
 
+ALTER TABLE public.intraday_prices OWNER TO postgres;
+
 --
--- Name: ipo_calendar; Type: TABLE; Schema: public; Owner: -
+-- Name: ipo_calendar; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.ipo_calendar (
@@ -512,8 +1156,10 @@ CREATE TABLE public.ipo_calendar (
 );
 
 
+ALTER TABLE public.ipo_calendar OWNER TO postgres;
+
 --
--- Name: macro_indicators; Type: TABLE; Schema: public; Owner: -
+-- Name: macro_indicators; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.macro_indicators (
@@ -524,8 +1170,10 @@ CREATE TABLE public.macro_indicators (
 );
 
 
+ALTER TABLE public.macro_indicators OWNER TO postgres;
+
 --
--- Name: news; Type: TABLE; Schema: public; Owner: -
+-- Name: news; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.news (
@@ -545,8 +1193,10 @@ CREATE TABLE public.news (
 );
 
 
+ALTER TABLE public.news OWNER TO postgres;
+
 --
--- Name: news_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: news_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.news_id_seq
@@ -557,15 +1207,69 @@ CREATE SEQUENCE public.news_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.news_id_seq OWNER TO postgres;
+
 --
--- Name: news_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: news_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.news_id_seq OWNED BY public.news.id;
 
 
 --
--- Name: options_chains; Type: TABLE; Schema: public; Owner: -
+-- Name: newsletter_config; Type: TABLE; Schema: public; Owner: jon
+--
+
+CREATE TABLE public.newsletter_config (
+    key text NOT NULL,
+    value numeric NOT NULL,
+    note text
+);
+
+
+ALTER TABLE public.newsletter_config OWNER TO jon;
+
+--
+-- Name: newsletter_findings; Type: TABLE; Schema: public; Owner: jon
+--
+
+CREATE TABLE public.newsletter_findings (
+    id bigint NOT NULL,
+    issue_date date NOT NULL,
+    section text NOT NULL,
+    rank integer NOT NULL,
+    ticker text,
+    headline text NOT NULL,
+    facts jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.newsletter_findings OWNER TO jon;
+
+--
+-- Name: newsletter_findings_id_seq; Type: SEQUENCE; Schema: public; Owner: jon
+--
+
+CREATE SEQUENCE public.newsletter_findings_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.newsletter_findings_id_seq OWNER TO jon;
+
+--
+-- Name: newsletter_findings_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: jon
+--
+
+ALTER SEQUENCE public.newsletter_findings_id_seq OWNED BY public.newsletter_findings.id;
+
+
+--
+-- Name: options_chains; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.options_chains (
@@ -596,8 +1300,10 @@ CREATE TABLE public.options_chains (
 );
 
 
+ALTER TABLE public.options_chains OWNER TO postgres;
+
 --
--- Name: options_chains_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: options_chains_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.options_chains_id_seq
@@ -608,15 +1314,17 @@ CREATE SEQUENCE public.options_chains_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.options_chains_id_seq OWNER TO postgres;
+
 --
--- Name: options_chains_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: options_chains_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.options_chains_id_seq OWNED BY public.options_chains.id;
 
 
 --
--- Name: trades; Type: TABLE; Schema: public; Owner: -
+-- Name: trades; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.trades (
@@ -637,8 +1345,10 @@ CREATE TABLE public.trades (
 );
 
 
+ALTER TABLE public.trades OWNER TO postgres;
+
 --
--- Name: portfolio_positions; Type: VIEW; Schema: public; Owner: -
+-- Name: portfolio_positions; Type: VIEW; Schema: public; Owner: postgres
 --
 
 CREATE VIEW public.portfolio_positions AS
@@ -682,8 +1392,10 @@ CREATE VIEW public.portfolio_positions AS
         END) <> (0)::numeric);
 
 
+ALTER VIEW public.portfolio_positions OWNER TO postgres;
+
 --
--- Name: portfolios; Type: TABLE; Schema: public; Owner: -
+-- Name: portfolios; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.portfolios (
@@ -698,8 +1410,10 @@ CREATE TABLE public.portfolios (
 );
 
 
+ALTER TABLE public.portfolios OWNER TO postgres;
+
 --
--- Name: portfolio_summary; Type: VIEW; Schema: public; Owner: -
+-- Name: portfolio_summary; Type: VIEW; Schema: public; Owner: postgres
 --
 
 CREATE VIEW public.portfolio_summary AS
@@ -725,8 +1439,77 @@ CREATE VIEW public.portfolio_summary AS
   GROUP BY p.id, p.user_id, p.name, p.base_currency, p.initial_cash;
 
 
+ALTER VIEW public.portfolio_summary OWNER TO postgres;
+
 --
--- Name: realtime_quotes; Type: TABLE; Schema: public; Owner: -
+-- Name: price_perf; Type: MATERIALIZED VIEW; Schema: public; Owner: jon
+--
+
+CREATE MATERIALIZED VIEW public.price_perf AS
+ WITH universe AS (
+         SELECT DISTINCT institutional_holders.ticker
+           FROM public.institutional_holders
+        ), recent AS (
+         SELECT p.ticker,
+            p.date,
+            p.adjusted_close,
+            p.volume
+           FROM (public.eod_prices p
+             JOIN universe u ON ((u.ticker = p.ticker)))
+          WHERE ((p.date >= (CURRENT_DATE - '400 days'::interval)) AND (p.adjusted_close IS NOT NULL) AND (p.adjusted_close > (0)::numeric))
+        ), lagged AS (
+         SELECT recent.ticker,
+            recent.date,
+            recent.adjusted_close,
+            recent.volume,
+            lag(recent.adjusted_close, 1) OVER w AS c_1d,
+            lag(recent.adjusted_close, 5) OVER w AS c_5d,
+            lag(recent.adjusted_close, 21) OVER w AS c_1m,
+            lag(recent.adjusted_close, 63) OVER w AS c_3m,
+            lag(recent.adjusted_close, 252) OVER w AS c_12m,
+            avg(recent.volume) OVER (PARTITION BY recent.ticker ORDER BY recent.date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS avg_vol_20d,
+            row_number() OVER (PARTITION BY recent.ticker ORDER BY recent.date DESC) AS rn
+           FROM recent
+          WINDOW w AS (PARTITION BY recent.ticker ORDER BY recent.date)
+        )
+ SELECT ticker,
+    date AS as_of,
+    adjusted_close AS close,
+    volume,
+    round(avg_vol_20d, 0) AS avg_vol_20d,
+        CASE
+            WHEN (avg_vol_20d > (0)::numeric) THEN round(((volume)::numeric / avg_vol_20d), 2)
+            ELSE NULL::numeric
+        END AS vol_ratio,
+        CASE
+            WHEN (c_1d > (0)::numeric) THEN round((((adjusted_close / c_1d) - (1)::numeric) * 100.0), 2)
+            ELSE NULL::numeric
+        END AS ret_1d,
+        CASE
+            WHEN (c_5d > (0)::numeric) THEN round((((adjusted_close / c_5d) - (1)::numeric) * 100.0), 2)
+            ELSE NULL::numeric
+        END AS ret_5d,
+        CASE
+            WHEN (c_1m > (0)::numeric) THEN round((((adjusted_close / c_1m) - (1)::numeric) * 100.0), 2)
+            ELSE NULL::numeric
+        END AS ret_1m,
+        CASE
+            WHEN (c_3m > (0)::numeric) THEN round((((adjusted_close / c_3m) - (1)::numeric) * 100.0), 2)
+            ELSE NULL::numeric
+        END AS ret_3m,
+        CASE
+            WHEN (c_12m > (0)::numeric) THEN round((((adjusted_close / c_12m) - (1)::numeric) * 100.0), 2)
+            ELSE NULL::numeric
+        END AS ret_12m
+   FROM lagged l
+  WHERE (rn = 1)
+  WITH NO DATA;
+
+
+ALTER MATERIALIZED VIEW public.price_perf OWNER TO jon;
+
+--
+-- Name: realtime_quotes; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.realtime_quotes (
@@ -744,8 +1527,10 @@ CREATE TABLE public.realtime_quotes (
 );
 
 
+ALTER TABLE public.realtime_quotes OWNER TO postgres;
+
 --
--- Name: sentiment_daily; Type: TABLE; Schema: public; Owner: -
+-- Name: sentiment_daily; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.sentiment_daily (
@@ -756,8 +1541,10 @@ CREATE TABLE public.sentiment_daily (
 );
 
 
+ALTER TABLE public.sentiment_daily OWNER TO postgres;
+
 --
--- Name: shares_outstanding; Type: TABLE; Schema: public; Owner: -
+-- Name: shares_outstanding; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.shares_outstanding (
@@ -768,8 +1555,10 @@ CREATE TABLE public.shares_outstanding (
 );
 
 
+ALTER TABLE public.shares_outstanding OWNER TO postgres;
+
 --
--- Name: splits; Type: TABLE; Schema: public; Owner: -
+-- Name: splits; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.splits (
@@ -781,8 +1570,10 @@ CREATE TABLE public.splits (
 );
 
 
+ALTER TABLE public.splits OWNER TO postgres;
+
 --
--- Name: splits_calendar; Type: TABLE; Schema: public; Owner: -
+-- Name: splits_calendar; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.splits_calendar (
@@ -798,8 +1589,10 @@ CREATE TABLE public.splits_calendar (
 );
 
 
+ALTER TABLE public.splits_calendar OWNER TO postgres;
+
 --
--- Name: symbol_change_history; Type: TABLE; Schema: public; Owner: -
+-- Name: symbol_change_history; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.symbol_change_history (
@@ -811,8 +1604,10 @@ CREATE TABLE public.symbol_change_history (
 );
 
 
+ALTER TABLE public.symbol_change_history OWNER TO postgres;
+
 --
--- Name: symbol_change_history_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: symbol_change_history_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.symbol_change_history_id_seq
@@ -823,15 +1618,17 @@ CREATE SEQUENCE public.symbol_change_history_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.symbol_change_history_id_seq OWNER TO postgres;
+
 --
--- Name: symbol_change_history_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: symbol_change_history_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.symbol_change_history_id_seq OWNED BY public.symbol_change_history.id;
 
 
 --
--- Name: symbols; Type: TABLE; Schema: public; Owner: -
+-- Name: symbols; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.symbols (
@@ -849,8 +1646,10 @@ CREATE TABLE public.symbols (
 );
 
 
+ALTER TABLE public.symbols OWNER TO postgres;
+
 --
--- Name: technical_indicators; Type: TABLE; Schema: public; Owner: -
+-- Name: technical_indicators; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.technical_indicators (
@@ -863,8 +1662,10 @@ CREATE TABLE public.technical_indicators (
 );
 
 
+ALTER TABLE public.technical_indicators OWNER TO postgres;
+
 --
--- Name: tick_data; Type: TABLE; Schema: public; Owner: -
+-- Name: tick_data; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.tick_data (
@@ -877,8 +1678,10 @@ CREATE TABLE public.tick_data (
 );
 
 
+ALTER TABLE public.tick_data OWNER TO postgres;
+
 --
--- Name: tick_data_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: tick_data_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
 
 CREATE SEQUENCE public.tick_data_id_seq
@@ -889,15 +1692,17 @@ CREATE SEQUENCE public.tick_data_id_seq
     CACHE 1;
 
 
+ALTER SEQUENCE public.tick_data_id_seq OWNER TO postgres;
+
 --
--- Name: tick_data_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: tick_data_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
 --
 
 ALTER SEQUENCE public.tick_data_id_seq OWNED BY public.tick_data.id;
 
 
 --
--- Name: users; Type: TABLE; Schema: public; Owner: -
+-- Name: users; Type: TABLE; Schema: public; Owner: postgres
 --
 
 CREATE TABLE public.users (
@@ -908,50 +1713,59 @@ CREATE TABLE public.users (
 );
 
 
+ALTER TABLE public.users OWNER TO postgres;
+
 --
--- Name: economic_events id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: economic_events id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.economic_events ALTER COLUMN id SET DEFAULT nextval('public.economic_events_id_seq'::regclass);
 
 
 --
--- Name: ingest_log id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: ingest_log id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.ingest_log ALTER COLUMN id SET DEFAULT nextval('public.ingest_log_id_seq'::regclass);
 
 
 --
--- Name: news id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: news id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.news ALTER COLUMN id SET DEFAULT nextval('public.news_id_seq'::regclass);
 
 
 --
--- Name: options_chains id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: newsletter_findings id; Type: DEFAULT; Schema: public; Owner: jon
+--
+
+ALTER TABLE ONLY public.newsletter_findings ALTER COLUMN id SET DEFAULT nextval('public.newsletter_findings_id_seq'::regclass);
+
+
+--
+-- Name: options_chains id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.options_chains ALTER COLUMN id SET DEFAULT nextval('public.options_chains_id_seq'::regclass);
 
 
 --
--- Name: symbol_change_history id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: symbol_change_history id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.symbol_change_history ALTER COLUMN id SET DEFAULT nextval('public.symbol_change_history_id_seq'::regclass);
 
 
 --
--- Name: tick_data id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: tick_data id; Type: DEFAULT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.tick_data ALTER COLUMN id SET DEFAULT nextval('public.tick_data_id_seq'::regclass);
 
 
 --
--- Name: analyst_ratings_history analyst_ratings_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: analyst_ratings_history analyst_ratings_history_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.analyst_ratings_history
@@ -959,7 +1773,7 @@ ALTER TABLE ONLY public.analyst_ratings_history
 
 
 --
--- Name: balance_sheets balance_sheets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: balance_sheets balance_sheets_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.balance_sheets
@@ -967,7 +1781,7 @@ ALTER TABLE ONLY public.balance_sheets
 
 
 --
--- Name: bond_fundamentals bond_fundamentals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: bond_fundamentals bond_fundamentals_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.bond_fundamentals
@@ -975,7 +1789,7 @@ ALTER TABLE ONLY public.bond_fundamentals
 
 
 --
--- Name: cash_flow_statements cash_flow_statements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: cash_flow_statements cash_flow_statements_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.cash_flow_statements
@@ -983,7 +1797,7 @@ ALTER TABLE ONLY public.cash_flow_statements
 
 
 --
--- Name: dividends dividends_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: dividends dividends_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.dividends
@@ -991,7 +1805,7 @@ ALTER TABLE ONLY public.dividends
 
 
 --
--- Name: earnings_calendar earnings_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: earnings_calendar earnings_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.earnings_calendar
@@ -999,7 +1813,7 @@ ALTER TABLE ONLY public.earnings_calendar
 
 
 --
--- Name: earnings_history earnings_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: earnings_history earnings_history_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.earnings_history
@@ -1007,7 +1821,7 @@ ALTER TABLE ONLY public.earnings_history
 
 
 --
--- Name: earnings_trend earnings_trend_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: earnings_trend earnings_trend_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.earnings_trend
@@ -1015,7 +1829,7 @@ ALTER TABLE ONLY public.earnings_trend
 
 
 --
--- Name: economic_events economic_events_event_date_country_type_period_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: economic_events economic_events_event_date_country_type_period_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.economic_events
@@ -1023,7 +1837,7 @@ ALTER TABLE ONLY public.economic_events
 
 
 --
--- Name: economic_events economic_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: economic_events economic_events_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.economic_events
@@ -1031,7 +1845,7 @@ ALTER TABLE ONLY public.economic_events
 
 
 --
--- Name: eod_prices eod_prices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: eod_prices eod_prices_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.eod_prices
@@ -1039,7 +1853,7 @@ ALTER TABLE ONLY public.eod_prices
 
 
 --
--- Name: exchange_details exchange_details_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: exchange_details exchange_details_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.exchange_details
@@ -1047,7 +1861,7 @@ ALTER TABLE ONLY public.exchange_details
 
 
 --
--- Name: exchanges exchanges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: exchanges exchanges_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.exchanges
@@ -1055,7 +1869,7 @@ ALTER TABLE ONLY public.exchanges
 
 
 --
--- Name: fund_holders fund_holders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: fund_holders fund_holders_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.fund_holders
@@ -1063,7 +1877,7 @@ ALTER TABLE ONLY public.fund_holders
 
 
 --
--- Name: fundamentals fundamentals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: fundamentals fundamentals_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.fundamentals
@@ -1071,7 +1885,7 @@ ALTER TABLE ONLY public.fundamentals
 
 
 --
--- Name: historical_market_cap historical_market_cap_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: historical_market_cap historical_market_cap_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.historical_market_cap
@@ -1079,7 +1893,7 @@ ALTER TABLE ONLY public.historical_market_cap
 
 
 --
--- Name: income_statements income_statements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: income_statements income_statements_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.income_statements
@@ -1087,7 +1901,7 @@ ALTER TABLE ONLY public.income_statements
 
 
 --
--- Name: index_constituents index_constituents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: index_constituents index_constituents_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.index_constituents
@@ -1095,7 +1909,7 @@ ALTER TABLE ONLY public.index_constituents
 
 
 --
--- Name: ingest_log ingest_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: ingest_log ingest_log_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.ingest_log
@@ -1103,7 +1917,7 @@ ALTER TABLE ONLY public.ingest_log
 
 
 --
--- Name: insider_transactions insider_transactions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: insider_transactions insider_transactions_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.insider_transactions
@@ -1111,7 +1925,7 @@ ALTER TABLE ONLY public.insider_transactions
 
 
 --
--- Name: institutional_holders institutional_holders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: institutional_holders institutional_holders_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.institutional_holders
@@ -1119,7 +1933,7 @@ ALTER TABLE ONLY public.institutional_holders
 
 
 --
--- Name: intraday_prices intraday_prices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: intraday_prices intraday_prices_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.intraday_prices
@@ -1127,7 +1941,7 @@ ALTER TABLE ONLY public.intraday_prices
 
 
 --
--- Name: ipo_calendar ipo_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: ipo_calendar ipo_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.ipo_calendar
@@ -1135,7 +1949,7 @@ ALTER TABLE ONLY public.ipo_calendar
 
 
 --
--- Name: macro_indicators macro_indicators_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: macro_indicators macro_indicators_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.macro_indicators
@@ -1143,7 +1957,7 @@ ALTER TABLE ONLY public.macro_indicators
 
 
 --
--- Name: news news_eodhd_uuid_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: news news_eodhd_uuid_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.news
@@ -1151,7 +1965,7 @@ ALTER TABLE ONLY public.news
 
 
 --
--- Name: news news_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: news news_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.news
@@ -1159,7 +1973,31 @@ ALTER TABLE ONLY public.news
 
 
 --
--- Name: options_chains options_chains_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: newsletter_config newsletter_config_pkey; Type: CONSTRAINT; Schema: public; Owner: jon
+--
+
+ALTER TABLE ONLY public.newsletter_config
+    ADD CONSTRAINT newsletter_config_pkey PRIMARY KEY (key);
+
+
+--
+-- Name: newsletter_findings newsletter_findings_issue_date_section_rank_key; Type: CONSTRAINT; Schema: public; Owner: jon
+--
+
+ALTER TABLE ONLY public.newsletter_findings
+    ADD CONSTRAINT newsletter_findings_issue_date_section_rank_key UNIQUE (issue_date, section, rank);
+
+
+--
+-- Name: newsletter_findings newsletter_findings_pkey; Type: CONSTRAINT; Schema: public; Owner: jon
+--
+
+ALTER TABLE ONLY public.newsletter_findings
+    ADD CONSTRAINT newsletter_findings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: options_chains options_chains_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.options_chains
@@ -1167,7 +2005,7 @@ ALTER TABLE ONLY public.options_chains
 
 
 --
--- Name: options_chains options_chains_ticker_expiration_date_option_type_strike_sn_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: options_chains options_chains_ticker_expiration_date_option_type_strike_sn_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.options_chains
@@ -1175,7 +2013,7 @@ ALTER TABLE ONLY public.options_chains
 
 
 --
--- Name: portfolios portfolios_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: portfolios portfolios_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.portfolios
@@ -1183,7 +2021,7 @@ ALTER TABLE ONLY public.portfolios
 
 
 --
--- Name: portfolios portfolios_user_id_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: portfolios portfolios_user_id_name_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.portfolios
@@ -1191,7 +2029,7 @@ ALTER TABLE ONLY public.portfolios
 
 
 --
--- Name: realtime_quotes realtime_quotes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: realtime_quotes realtime_quotes_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.realtime_quotes
@@ -1199,7 +2037,7 @@ ALTER TABLE ONLY public.realtime_quotes
 
 
 --
--- Name: sentiment_daily sentiment_daily_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: sentiment_daily sentiment_daily_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.sentiment_daily
@@ -1207,7 +2045,7 @@ ALTER TABLE ONLY public.sentiment_daily
 
 
 --
--- Name: shares_outstanding shares_outstanding_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: shares_outstanding shares_outstanding_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.shares_outstanding
@@ -1215,7 +2053,7 @@ ALTER TABLE ONLY public.shares_outstanding
 
 
 --
--- Name: splits_calendar splits_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: splits_calendar splits_calendar_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.splits_calendar
@@ -1223,7 +2061,7 @@ ALTER TABLE ONLY public.splits_calendar
 
 
 --
--- Name: splits splits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: splits splits_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.splits
@@ -1231,7 +2069,7 @@ ALTER TABLE ONLY public.splits
 
 
 --
--- Name: symbol_change_history symbol_change_history_date_old_symbol_new_symbol_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: symbol_change_history symbol_change_history_date_old_symbol_new_symbol_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.symbol_change_history
@@ -1239,7 +2077,7 @@ ALTER TABLE ONLY public.symbol_change_history
 
 
 --
--- Name: symbol_change_history symbol_change_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: symbol_change_history symbol_change_history_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.symbol_change_history
@@ -1247,7 +2085,7 @@ ALTER TABLE ONLY public.symbol_change_history
 
 
 --
--- Name: symbols symbols_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: symbols symbols_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.symbols
@@ -1255,7 +2093,7 @@ ALTER TABLE ONLY public.symbols
 
 
 --
--- Name: technical_indicators technical_indicators_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: technical_indicators technical_indicators_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.technical_indicators
@@ -1263,7 +2101,7 @@ ALTER TABLE ONLY public.technical_indicators
 
 
 --
--- Name: tick_data tick_data_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: tick_data tick_data_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.tick_data
@@ -1271,7 +2109,7 @@ ALTER TABLE ONLY public.tick_data
 
 
 --
--- Name: trades trades_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: trades trades_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.trades
@@ -1279,7 +2117,7 @@ ALTER TABLE ONLY public.trades
 
 
 --
--- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.users
@@ -1287,7 +2125,7 @@ ALTER TABLE ONLY public.users
 
 
 --
--- Name: users users_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: users users_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.users
@@ -1295,175 +2133,308 @@ ALTER TABLE ONLY public.users
 
 
 --
--- Name: economic_events_country_date_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: economic_events_country_date_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX economic_events_country_date_idx ON public.economic_events USING btree (country, event_date DESC);
 
 
 --
--- Name: eod_prices_date_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: eod_prices_date_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX eod_prices_date_idx ON public.eod_prices USING btree (date);
 
 
 --
--- Name: fundamentals_country_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: fund_flow_action_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX fund_flow_action_idx ON public.fund_flow USING btree (action);
+
+
+--
+-- Name: fund_flow_pk; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE UNIQUE INDEX fund_flow_pk ON public.fund_flow USING btree (ticker, holder_name, report_date);
+
+
+--
+-- Name: fund_flow_ticker_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX fund_flow_ticker_idx ON public.fund_flow USING btree (ticker);
+
+
+--
+-- Name: fund_flow_ticker_net_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX fund_flow_ticker_net_idx ON public.fund_flow_ticker USING btree (net_change_pct);
+
+
+--
+-- Name: fund_flow_ticker_pk; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE UNIQUE INDEX fund_flow_ticker_pk ON public.fund_flow_ticker USING btree (ticker);
+
+
+--
+-- Name: fund_holders_observed_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX fund_holders_observed_idx ON public.fund_holders USING btree (observed_at);
+
+
+--
+-- Name: fundamentals_country_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX fundamentals_country_idx ON public.fundamentals USING btree (country);
 
 
 --
--- Name: fundamentals_financials_gin; Type: INDEX; Schema: public; Owner: -
+-- Name: fundamentals_financials_gin; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX fundamentals_financials_gin ON public.fundamentals USING gin (financials);
 
 
 --
--- Name: fundamentals_general_gin; Type: INDEX; Schema: public; Owner: -
+-- Name: fundamentals_general_gin; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX fundamentals_general_gin ON public.fundamentals USING gin (general);
 
 
 --
--- Name: fundamentals_industry_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: fundamentals_industry_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX fundamentals_industry_idx ON public.fundamentals USING btree (industry);
 
 
 --
--- Name: fundamentals_sector_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: fundamentals_sector_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX fundamentals_sector_idx ON public.fundamentals USING btree (sector);
 
 
 --
--- Name: ingest_log_endpoint_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: ingest_log_endpoint_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX ingest_log_endpoint_idx ON public.ingest_log USING btree (endpoint, started_at DESC);
 
 
 --
--- Name: intraday_prices_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: insider_transactions_report_date_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX insider_transactions_report_date_idx ON public.insider_transactions USING btree (report_date);
+
+
+--
+-- Name: inst_flow_action_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX inst_flow_action_idx ON public.inst_flow USING btree (action);
+
+
+--
+-- Name: inst_flow_pk; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE UNIQUE INDEX inst_flow_pk ON public.inst_flow USING btree (ticker, holder_name, report_date);
+
+
+--
+-- Name: inst_flow_rdate_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX inst_flow_rdate_idx ON public.inst_flow USING btree (report_date);
+
+
+--
+-- Name: inst_flow_ticker_date_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX inst_flow_ticker_date_idx ON public.inst_flow_ticker USING btree (latest_filing);
+
+
+--
+-- Name: inst_flow_ticker_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX inst_flow_ticker_idx ON public.inst_flow USING btree (ticker);
+
+
+--
+-- Name: inst_flow_ticker_net_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX inst_flow_ticker_net_idx ON public.inst_flow_ticker USING btree (net_change_pct);
+
+
+--
+-- Name: inst_flow_ticker_pk; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE UNIQUE INDEX inst_flow_ticker_pk ON public.inst_flow_ticker USING btree (ticker);
+
+
+--
+-- Name: inst_holders_observed_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX inst_holders_observed_idx ON public.institutional_holders USING btree (observed_at);
+
+
+--
+-- Name: intraday_prices_ts_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX intraday_prices_ts_idx ON public.intraday_prices USING btree (ts);
 
 
 --
--- Name: news_symbols_gin; Type: INDEX; Schema: public; Owner: -
+-- Name: news_symbols_gin; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX news_symbols_gin ON public.news USING gin (symbols);
 
 
 --
--- Name: news_tags_gin; Type: INDEX; Schema: public; Owner: -
+-- Name: news_tags_gin; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX news_tags_gin ON public.news USING gin (tags);
 
 
 --
--- Name: news_ticker_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: news_ticker_ts_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX news_ticker_ts_idx ON public.news USING btree (ticker, published_at DESC);
 
 
 --
--- Name: options_chains_ticker_exp_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: newsletter_findings_issue_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX newsletter_findings_issue_idx ON public.newsletter_findings USING btree (issue_date, section, rank);
+
+
+--
+-- Name: options_chains_ticker_exp_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX options_chains_ticker_exp_idx ON public.options_chains USING btree (ticker, expiration_date);
 
 
 --
--- Name: symbols_code_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: price_perf_asof_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX price_perf_asof_idx ON public.price_perf USING btree (as_of);
+
+
+--
+-- Name: price_perf_pk; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE UNIQUE INDEX price_perf_pk ON public.price_perf USING btree (ticker);
+
+
+--
+-- Name: price_perf_ret1d_idx; Type: INDEX; Schema: public; Owner: jon
+--
+
+CREATE INDEX price_perf_ret1d_idx ON public.price_perf USING btree (ret_1d);
+
+
+--
+-- Name: symbols_code_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX symbols_code_idx ON public.symbols USING btree (code);
 
 
 --
--- Name: symbols_exchange_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: symbols_exchange_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX symbols_exchange_idx ON public.symbols USING btree (exchange_code);
 
 
 --
--- Name: symbols_isin_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: symbols_isin_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX symbols_isin_idx ON public.symbols USING btree (isin) WHERE (isin IS NOT NULL);
 
 
 --
--- Name: tick_data_ticker_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: tick_data_ticker_ts_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX tick_data_ticker_ts_idx ON public.tick_data USING btree (ticker, ts);
 
 
 --
--- Name: trades_date_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: trades_date_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX trades_date_idx ON public.trades USING btree (trade_date);
 
 
 --
--- Name: trades_portfolio_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: trades_portfolio_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX trades_portfolio_idx ON public.trades USING btree (portfolio_id);
 
 
 --
--- Name: trades_ticker_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: trades_ticker_idx; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX trades_ticker_idx ON public.trades USING btree (ticker);
 
 
 --
--- Name: exchanges exchanges_touch; Type: TRIGGER; Schema: public; Owner: -
+-- Name: exchanges exchanges_touch; Type: TRIGGER; Schema: public; Owner: postgres
 --
 
 CREATE TRIGGER exchanges_touch BEFORE UPDATE ON public.exchanges FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
 
 
 --
--- Name: fundamentals fundamentals_touch; Type: TRIGGER; Schema: public; Owner: -
+-- Name: fundamentals fundamentals_touch; Type: TRIGGER; Schema: public; Owner: postgres
 --
 
 CREATE TRIGGER fundamentals_touch BEFORE UPDATE ON public.fundamentals FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
 
 
 --
--- Name: portfolios portfolios_touch; Type: TRIGGER; Schema: public; Owner: -
+-- Name: portfolios portfolios_touch; Type: TRIGGER; Schema: public; Owner: postgres
 --
 
 CREATE TRIGGER portfolios_touch BEFORE UPDATE ON public.portfolios FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
 
 
 --
--- Name: symbols symbols_touch; Type: TRIGGER; Schema: public; Owner: -
+-- Name: symbols symbols_touch; Type: TRIGGER; Schema: public; Owner: postgres
 --
 
 CREATE TRIGGER symbols_touch BEFORE UPDATE ON public.symbols FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
 
 
 --
--- Name: analyst_ratings_history analyst_ratings_history_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: analyst_ratings_history analyst_ratings_history_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.analyst_ratings_history
@@ -1471,7 +2442,7 @@ ALTER TABLE ONLY public.analyst_ratings_history
 
 
 --
--- Name: balance_sheets balance_sheets_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: balance_sheets balance_sheets_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.balance_sheets
@@ -1479,7 +2450,7 @@ ALTER TABLE ONLY public.balance_sheets
 
 
 --
--- Name: cash_flow_statements cash_flow_statements_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: cash_flow_statements cash_flow_statements_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.cash_flow_statements
@@ -1487,7 +2458,7 @@ ALTER TABLE ONLY public.cash_flow_statements
 
 
 --
--- Name: dividends dividends_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: dividends dividends_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.dividends
@@ -1495,7 +2466,7 @@ ALTER TABLE ONLY public.dividends
 
 
 --
--- Name: earnings_history earnings_history_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: earnings_history earnings_history_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.earnings_history
@@ -1503,7 +2474,7 @@ ALTER TABLE ONLY public.earnings_history
 
 
 --
--- Name: earnings_trend earnings_trend_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: earnings_trend earnings_trend_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.earnings_trend
@@ -1511,7 +2482,7 @@ ALTER TABLE ONLY public.earnings_trend
 
 
 --
--- Name: eod_prices eod_prices_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: eod_prices eod_prices_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.eod_prices
@@ -1519,7 +2490,7 @@ ALTER TABLE ONLY public.eod_prices
 
 
 --
--- Name: exchange_details exchange_details_exchange_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: exchange_details exchange_details_exchange_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.exchange_details
@@ -1527,7 +2498,7 @@ ALTER TABLE ONLY public.exchange_details
 
 
 --
--- Name: fund_holders fund_holders_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: fund_holders fund_holders_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.fund_holders
@@ -1535,7 +2506,7 @@ ALTER TABLE ONLY public.fund_holders
 
 
 --
--- Name: fundamentals fundamentals_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: fundamentals fundamentals_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.fundamentals
@@ -1543,7 +2514,7 @@ ALTER TABLE ONLY public.fundamentals
 
 
 --
--- Name: historical_market_cap historical_market_cap_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: historical_market_cap historical_market_cap_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.historical_market_cap
@@ -1551,7 +2522,7 @@ ALTER TABLE ONLY public.historical_market_cap
 
 
 --
--- Name: income_statements income_statements_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: income_statements income_statements_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.income_statements
@@ -1559,7 +2530,7 @@ ALTER TABLE ONLY public.income_statements
 
 
 --
--- Name: insider_transactions insider_transactions_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: insider_transactions insider_transactions_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.insider_transactions
@@ -1567,7 +2538,7 @@ ALTER TABLE ONLY public.insider_transactions
 
 
 --
--- Name: institutional_holders institutional_holders_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: institutional_holders institutional_holders_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.institutional_holders
@@ -1575,7 +2546,7 @@ ALTER TABLE ONLY public.institutional_holders
 
 
 --
--- Name: intraday_prices intraday_prices_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: intraday_prices intraday_prices_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.intraday_prices
@@ -1583,7 +2554,7 @@ ALTER TABLE ONLY public.intraday_prices
 
 
 --
--- Name: news news_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: news news_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.news
@@ -1591,7 +2562,7 @@ ALTER TABLE ONLY public.news
 
 
 --
--- Name: options_chains options_chains_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: options_chains options_chains_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.options_chains
@@ -1599,7 +2570,7 @@ ALTER TABLE ONLY public.options_chains
 
 
 --
--- Name: portfolios portfolios_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: portfolios portfolios_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.portfolios
@@ -1607,7 +2578,7 @@ ALTER TABLE ONLY public.portfolios
 
 
 --
--- Name: realtime_quotes realtime_quotes_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: realtime_quotes realtime_quotes_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.realtime_quotes
@@ -1615,7 +2586,7 @@ ALTER TABLE ONLY public.realtime_quotes
 
 
 --
--- Name: sentiment_daily sentiment_daily_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: sentiment_daily sentiment_daily_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.sentiment_daily
@@ -1623,7 +2594,7 @@ ALTER TABLE ONLY public.sentiment_daily
 
 
 --
--- Name: shares_outstanding shares_outstanding_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: shares_outstanding shares_outstanding_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.shares_outstanding
@@ -1631,7 +2602,7 @@ ALTER TABLE ONLY public.shares_outstanding
 
 
 --
--- Name: splits splits_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: splits splits_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.splits
@@ -1639,7 +2610,7 @@ ALTER TABLE ONLY public.splits
 
 
 --
--- Name: symbols symbols_exchange_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: symbols symbols_exchange_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.symbols
@@ -1647,7 +2618,7 @@ ALTER TABLE ONLY public.symbols
 
 
 --
--- Name: technical_indicators technical_indicators_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: technical_indicators technical_indicators_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.technical_indicators
@@ -1655,7 +2626,7 @@ ALTER TABLE ONLY public.technical_indicators
 
 
 --
--- Name: tick_data tick_data_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: tick_data tick_data_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.tick_data
@@ -1663,7 +2634,7 @@ ALTER TABLE ONLY public.tick_data
 
 
 --
--- Name: trades trades_portfolio_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: trades trades_portfolio_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.trades
@@ -1671,7 +2642,7 @@ ALTER TABLE ONLY public.trades
 
 
 --
--- Name: trades trades_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: trades trades_ticker_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.trades
@@ -1679,8 +2650,405 @@ ALTER TABLE ONLY public.trades
 
 
 --
+-- Name: SCHEMA public; Type: ACL; Schema: -; Owner: pg_database_owner
+--
+
+GRANT USAGE ON SCHEMA public TO readonly_agent;
+GRANT USAGE ON SCHEMA public TO ai_agent;
+
+
+--
+-- Name: FUNCTION cfg(p_key text); Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT ALL ON FUNCTION public.cfg(p_key text) TO ai_agent;
+
+
+--
+-- Name: FUNCTION newsletter_payload(p_issue_date date); Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT ALL ON FUNCTION public.newsletter_payload(p_issue_date date) TO ai_agent;
+
+
+--
+-- Name: TABLE analyst_ratings_history; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.analyst_ratings_history TO readonly_agent;
+GRANT SELECT ON TABLE public.analyst_ratings_history TO ai_agent;
+
+
+--
+-- Name: TABLE balance_sheets; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.balance_sheets TO readonly_agent;
+GRANT SELECT ON TABLE public.balance_sheets TO ai_agent;
+
+
+--
+-- Name: TABLE bond_fundamentals; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.bond_fundamentals TO readonly_agent;
+GRANT SELECT ON TABLE public.bond_fundamentals TO ai_agent;
+
+
+--
+-- Name: TABLE cash_flow_statements; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.cash_flow_statements TO readonly_agent;
+GRANT SELECT ON TABLE public.cash_flow_statements TO ai_agent;
+
+
+--
+-- Name: TABLE dividends; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.dividends TO readonly_agent;
+GRANT SELECT ON TABLE public.dividends TO ai_agent;
+
+
+--
+-- Name: TABLE earnings_calendar; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.earnings_calendar TO readonly_agent;
+GRANT SELECT ON TABLE public.earnings_calendar TO ai_agent;
+
+
+--
+-- Name: TABLE earnings_history; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.earnings_history TO readonly_agent;
+GRANT SELECT ON TABLE public.earnings_history TO ai_agent;
+
+
+--
+-- Name: TABLE earnings_trend; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.earnings_trend TO readonly_agent;
+GRANT SELECT ON TABLE public.earnings_trend TO ai_agent;
+
+
+--
+-- Name: TABLE economic_events; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.economic_events TO readonly_agent;
+GRANT SELECT ON TABLE public.economic_events TO ai_agent;
+
+
+--
+-- Name: TABLE eod_prices; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.eod_prices TO readonly_agent;
+GRANT SELECT ON TABLE public.eod_prices TO ai_agent;
+
+
+--
+-- Name: TABLE exchange_details; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.exchange_details TO readonly_agent;
+GRANT SELECT ON TABLE public.exchange_details TO ai_agent;
+
+
+--
+-- Name: TABLE exchanges; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.exchanges TO readonly_agent;
+GRANT SELECT ON TABLE public.exchanges TO ai_agent;
+
+
+--
+-- Name: TABLE fund_holders; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.fund_holders TO readonly_agent;
+GRANT SELECT ON TABLE public.fund_holders TO ai_agent;
+
+
+--
+-- Name: TABLE fund_flow; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.fund_flow TO ai_agent;
+
+
+--
+-- Name: TABLE fund_flow_ticker; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.fund_flow_ticker TO ai_agent;
+
+
+--
+-- Name: TABLE fundamentals; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.fundamentals TO readonly_agent;
+GRANT SELECT ON TABLE public.fundamentals TO ai_agent;
+
+
+--
+-- Name: TABLE historical_market_cap; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.historical_market_cap TO readonly_agent;
+GRANT SELECT ON TABLE public.historical_market_cap TO ai_agent;
+
+
+--
+-- Name: TABLE income_statements; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.income_statements TO readonly_agent;
+GRANT SELECT ON TABLE public.income_statements TO ai_agent;
+
+
+--
+-- Name: TABLE index_constituents; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.index_constituents TO readonly_agent;
+GRANT SELECT ON TABLE public.index_constituents TO ai_agent;
+
+
+--
+-- Name: TABLE ingest_log; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.ingest_log TO readonly_agent;
+GRANT SELECT ON TABLE public.ingest_log TO ai_agent;
+
+
+--
+-- Name: TABLE insider_transactions; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.insider_transactions TO readonly_agent;
+GRANT SELECT ON TABLE public.insider_transactions TO ai_agent;
+
+
+--
+-- Name: TABLE institutional_holders; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.institutional_holders TO readonly_agent;
+GRANT SELECT ON TABLE public.institutional_holders TO ai_agent;
+
+
+--
+-- Name: TABLE inst_flow; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.inst_flow TO ai_agent;
+
+
+--
+-- Name: TABLE inst_flow_ticker; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.inst_flow_ticker TO ai_agent;
+
+
+--
+-- Name: TABLE intraday_prices; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.intraday_prices TO readonly_agent;
+GRANT SELECT ON TABLE public.intraday_prices TO ai_agent;
+
+
+--
+-- Name: TABLE ipo_calendar; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.ipo_calendar TO readonly_agent;
+GRANT SELECT ON TABLE public.ipo_calendar TO ai_agent;
+
+
+--
+-- Name: TABLE macro_indicators; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.macro_indicators TO readonly_agent;
+GRANT SELECT ON TABLE public.macro_indicators TO ai_agent;
+
+
+--
+-- Name: TABLE news; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.news TO readonly_agent;
+GRANT SELECT ON TABLE public.news TO ai_agent;
+
+
+--
+-- Name: TABLE newsletter_config; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.newsletter_config TO ai_agent;
+
+
+--
+-- Name: TABLE newsletter_findings; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.newsletter_findings TO ai_agent;
+
+
+--
+-- Name: TABLE options_chains; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.options_chains TO readonly_agent;
+GRANT SELECT ON TABLE public.options_chains TO ai_agent;
+
+
+--
+-- Name: TABLE trades; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.trades TO readonly_agent;
+GRANT SELECT ON TABLE public.trades TO ai_agent;
+
+
+--
+-- Name: TABLE portfolio_positions; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.portfolio_positions TO readonly_agent;
+GRANT SELECT ON TABLE public.portfolio_positions TO ai_agent;
+
+
+--
+-- Name: TABLE portfolios; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.portfolios TO readonly_agent;
+GRANT SELECT ON TABLE public.portfolios TO ai_agent;
+
+
+--
+-- Name: TABLE portfolio_summary; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.portfolio_summary TO readonly_agent;
+GRANT SELECT ON TABLE public.portfolio_summary TO ai_agent;
+
+
+--
+-- Name: TABLE price_perf; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.price_perf TO ai_agent;
+
+
+--
+-- Name: TABLE realtime_quotes; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.realtime_quotes TO readonly_agent;
+GRANT SELECT ON TABLE public.realtime_quotes TO ai_agent;
+
+
+--
+-- Name: TABLE sentiment_daily; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.sentiment_daily TO readonly_agent;
+GRANT SELECT ON TABLE public.sentiment_daily TO ai_agent;
+
+
+--
+-- Name: TABLE shares_outstanding; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.shares_outstanding TO readonly_agent;
+GRANT SELECT ON TABLE public.shares_outstanding TO ai_agent;
+
+
+--
+-- Name: TABLE splits; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.splits TO readonly_agent;
+GRANT SELECT ON TABLE public.splits TO ai_agent;
+
+
+--
+-- Name: TABLE splits_calendar; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.splits_calendar TO readonly_agent;
+GRANT SELECT ON TABLE public.splits_calendar TO ai_agent;
+
+
+--
+-- Name: TABLE symbol_change_history; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.symbol_change_history TO readonly_agent;
+GRANT SELECT ON TABLE public.symbol_change_history TO ai_agent;
+
+
+--
+-- Name: TABLE symbols; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.symbols TO readonly_agent;
+GRANT SELECT ON TABLE public.symbols TO ai_agent;
+
+
+--
+-- Name: TABLE technical_indicators; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.technical_indicators TO readonly_agent;
+GRANT SELECT ON TABLE public.technical_indicators TO ai_agent;
+
+
+--
+-- Name: TABLE tick_data; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.tick_data TO readonly_agent;
+GRANT SELECT ON TABLE public.tick_data TO ai_agent;
+
+
+--
+-- Name: TABLE users; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT SELECT ON TABLE public.users TO readonly_agent;
+GRANT SELECT ON TABLE public.users TO ai_agent;
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: public; Owner: jon
+--
+
+ALTER DEFAULT PRIVILEGES FOR ROLE jon IN SCHEMA public GRANT SELECT ON TABLES TO ai_agent;
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: public; Owner: postgres
+--
+
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABLES TO readonly_agent;
+
+
+--
 -- PostgreSQL database dump complete
 --
 
-\unrestrict EIMFcdFZoCyPFH1zHLwfq4L0ZIeUEt0LMCsZzKXl2mwn6iXNNSReQXQESqPKs6f
+\unrestrict DNXS9lbKgkZGdyNb9WLkhOs7ifRDzgqbXv1H4AhEf0Os6vH7gaKnQLrTCs7cofc
 
