@@ -16,3 +16,4 @@ venv.bak/
 # logs
 *.log
 *.csv
+old_*

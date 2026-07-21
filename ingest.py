@@ -702,7 +702,10 @@ class Ingestor:
         self._ingest_earnings_trend(ticker, f.get("Earnings") or {})
         self._ingest_outstanding_shares(ticker, f.get("outstandingShares") or {})
         self._ingest_holders(ticker, f.get("Holders") or {})
-        self._ingest_insider_block(ticker, f.get("InsiderTransactions") or {})
+        # Insider transactions now come from the dedicated endpoint via
+        # ingest_insider() -- it carries the SEC filing date, relationship and
+        # title that the fundamentals InsiderTransactions block lacks. The lean
+        # block is still stored as jsonb above for provenance/backfill.
 
         log.info("fundamentals(%s): ok", ticker)
 
@@ -942,33 +945,90 @@ class Ingestor:
             fparams,
         )
 
-    def _ingest_insider_block(self, ticker: str, payload: dict) -> None:
-        params = []
-        for _, row in (payload or {}).items():
-            if not isinstance(row, dict):
-                continue
-            td = _to_date(row.get("transactionDate"))
+    def ingest_insider(self, ticker: str, from_date: str | None = None,
+                       to_date: str | None = None, limit: int = 1000) -> int:
+        """Pull SEC Form 4 insider transactions from the dedicated endpoint.
+
+        Replaces the old fundamentals-block path, which read three keys that do
+        not exist in that block (``transactionShares`` -> shares landed 0.00;
+        ``transactionAcquiredDisposedCode`` -> null; and stored
+        ``postTransactionAmount`` in the value column). The dedicated endpoint's
+        real keys are ``transactionAmount`` / ``transactionPrice`` /
+        ``transactionAcquiredDisposed``, and it additionally carries the SEC
+        filing date (``reportDate``), ``ownerRelationship`` and ``ownerTitle``.
+
+        There is no dollar-value field in either source, so ``value`` is derived
+        as transactionAmount * transactionPrice.
+
+        Costs 10 API calls per request. New rows are inserted complete; rows that
+        already exist (e.g. from the old block path) are enriched in place with
+        report_date / owner_title / relationship and any repaired shares/value,
+        so a re-pull upgrades history without duplicating it.
+        """
+        self.ensure_symbol(ticker)
+        rows = _as_list(self.api.get_insider_transactions_data(
+            code=ticker, date_from=from_date, date_to=to_date, limit=limit))
+
+        ins_params, upd_params = [], []
+        for row in rows:
+            td = _to_date(row.get("transactionDate") or row.get("date"))
             if not td:
                 continue
-            shares = _to_num(row.get("transactionShares")) or 0
-            params.append((
+            shares = _to_num(row.get("transactionAmount"))
+            price = _to_num(row.get("transactionPrice"))
+            value = shares * price if (shares is not None and price is not None) else None
+            report_date = _to_date(row.get("reportDate"))
+            owner_name = row.get("ownerName")
+            code = row.get("transactionCode")
+            acq = row.get("transactionAcquiredDisposed")
+            title = row.get("ownerTitle")
+            relationship = row.get("ownerRelationship")
+
+            ins_params.append((
                 ticker, td,
-                row.get("ownerCik"), row.get("ownerName"),
-                row.get("ownerRelationship"),
-                row.get("transactionCode"),
-                row.get("transactionAcquiredDisposedCode"),
-                shares,
-                _to_num(row.get("transactionPrice")),
-                _to_num(row.get("postTransactionAmount")),
+                row.get("ownerCik"), owner_name,
+                relationship, code, acq,
+                shares, price, value,
+                report_date, title,
             ))
+            # Enrichment key mirrors backfill_insider.sql: match pre-existing
+            # rows on the fields the old bug left intact (date/owner/code/price).
+            upd_params.append((
+                report_date, title, relationship, acq, shares, price, value,
+                ticker, td, owner_name, code, price,
+            ))
+
+        if not ins_params:
+            return 0
+
         execute_many(
-            """INSERT INTO insider_transactions (ticker,transaction_date,owner_cik,owner_name,
-                                                 relationship,transaction_code,
-                                                 acquisition_or_disposition,shares,price,value)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """INSERT INTO insider_transactions
+                   (ticker,transaction_date,owner_cik,owner_name,
+                    relationship,transaction_code,acquisition_or_disposition,
+                    shares,price,value,report_date,owner_title)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT DO NOTHING""",
-            params,
+            ins_params,
         )
+        # INSERT skipped rows that already existed; enrich those in place.
+        execute_many(
+            """UPDATE insider_transactions t SET
+                   report_date = COALESCE(t.report_date, %s),
+                   owner_title = COALESCE(t.owner_title, %s),
+                   relationship = COALESCE(t.relationship, %s),
+                   acquisition_or_disposition =
+                       COALESCE(t.acquisition_or_disposition, %s),
+                   shares = COALESCE(NULLIF(t.shares, 0), %s),
+                   price  = COALESCE(t.price, %s),
+                   value  = COALESCE(t.value, %s)
+               WHERE t.ticker = %s
+                 AND t.transaction_date = %s
+                 AND t.owner_name IS NOT DISTINCT FROM %s
+                 AND t.transaction_code = %s
+                 AND round(t.price::numeric, 4) IS NOT DISTINCT FROM round((%s)::numeric, 4)""",
+            upd_params,
+        )
+        return len(ins_params)
 
     # =================================================================
     # NEWS & SENTIMENT
@@ -1286,6 +1346,10 @@ class Ingestor:
             self.ingest_sentiment(ticker)
         except (Exception, SystemExit) as e:  # eodhd may sys.exit() on API errors
             log.warning("sentiment(%s) skipped: %s", ticker, e)
+        try:
+            self.ingest_insider(ticker)  # dedicated endpoint: 10 API calls
+        except (Exception, SystemExit) as e:  # eodhd may sys.exit() on API errors
+            log.warning("insider(%s) skipped: %s", ticker, e)
 
     def refresh_eod_all(self, since: str | None = None) -> None:
         rows = fetch_all("SELECT ticker FROM symbols WHERE is_active=TRUE")
@@ -1321,6 +1385,11 @@ def _cli() -> None:
 
     s = sub.add_parser("fundamentals")
     s.add_argument("ticker")
+
+    s = sub.add_parser("insider")
+    s.add_argument("ticker")
+    s.add_argument("--from", dest="from_date")
+    s.add_argument("--to", dest="to_date")
 
     s = sub.add_parser("dividends")
     s.add_argument("ticker")
@@ -1377,6 +1446,8 @@ def _cli() -> None:
         ing.ingest_intraday(args.ticker, args.interval)
     elif args.cmd == "fundamentals":
         ing.ingest_fundamentals(args.ticker)
+    elif args.cmd == "insider":
+        ing.ingest_insider(args.ticker, args.from_date, args.to_date)
     elif args.cmd == "dividends":
         ing.ingest_dividends(args.ticker)
     elif args.cmd == "splits":
