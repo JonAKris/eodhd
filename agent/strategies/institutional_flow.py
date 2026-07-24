@@ -1,33 +1,39 @@
 """
 strategies.institutional_flow
 ==============================
-The first concrete strategy. It wraps `inst_flow_ticker` -- it does not
-recompute anything. All the flow math (per-holder delta labelling, the
-latest-filing anchor, the top-N cap accounting) already lives in the
-materialized view built by 01_metrics_views.sql, and duplicating it in Python
-would be two implementations drifting apart. The strategy's whole job is to
-(1) read the rollup, (2) apply the data-validity floors, (3) enforce the
+Wraps the holder-flow rollup -- it does not recompute anything. All the flow
+math (per-holder delta labelling, the latest-filing anchor, the top-N cap
+accounting) lives in 01_metrics_views.sql; duplicating it in Python would be two
+implementations drifting apart. The strategy's job is to (1) read the right
+vintage of the rollup, (2) apply the data-validity floors, (3) enforce the
 no-look-ahead as_of contract, and (4) carry the view's bias caveats forward in
 structured form so a ranker can use the number honestly.
 
 The signal is `net_change_pct` -- the same figure the newsletter ranks
 inst_accumulation / inst_distribution on.
 
-Why this signal is prospective-only, enforced in code
------------------------------------------------------
-`institutional_holders` is a *current-snapshot* source: it lists each ticker's
-present holders with EODHD's own per-holder change. It does not contain history.
-You therefore cannot ask "what did net_change_pct look like six months ago" and
-get an honest answer from a single snapshot -- that reading only exists once you
-have *banked* the snapshot as a dated vintage.
+Two sources, one behaviour
+--------------------------
+`institutional_holders` is a *current-snapshot* source with no history, so the
+live rollup `inst_flow_ticker` can only answer "what is true now". The vintage
+layer (flow_vintages.sql) fixes that by appending a dated copy of the rollup on
+every refresh, into `inst_flow_vintage`, stamped with `banked_at`.
 
-So `evaluate` gates on `observed_at`: if the only vintage we hold was observed
-*after* the requested as_of, the honest answer is "we did not know this then,"
-returned as an excluded Signal -- never a reconstruction. With just the live
-view (one vintage, observed now), every historical backtest date correctly
-returns None, which is precisely the truth: this signal cannot be backtested
-retrospectively, only accumulated forward. When a vintage history table exists,
-only the relation name in `_VINTAGE_SQL` changes; the contract does not.
+  * When banked vintages exist, the strategy reads the latest vintage with
+    `banked_at <= as_of` -- the most recent reading the system had actually
+    stored by that date. A historical as_of now returns a REAL value, as far
+    back as the first bank. This is the promotion from prospective-only to
+    backtestable; it reaches back only to when banking began, because we cannot
+    query a vintage we never observed.
+  * Before any vintages are banked (table absent or empty), it falls back to
+    the live rollup and the original prospective-only gate on `observed_at`: a
+    historical as_of returns None, because the single live snapshot is all we
+    have. This keeps live `select` working the moment the strategy ships,
+    before the first bank.
+
+Either way the knowability gate is honest -- banked_at for vintages (when it
+entered our store), observed_at for the live fallback (when the holders were
+observed) -- and never reconstructs a reading it didn't hold.
 """
 from __future__ import annotations
 
@@ -37,53 +43,88 @@ from typing import Optional
 from ..core.contract import Signal
 from ..core.context import Context
 
+_UNSET = object()
 
-# Reads the current rollup as a single vintage. To generalize to a banked
-# history, point this at the vintage table and add
-#   AND observed_at::date <= %(as_of)s  ORDER BY observed_at DESC LIMIT 1
-# The Python gate below already models that selection for the single-vintage case.
-_VINTAGE_SQL = """
-    SELECT ticker,
-           latest_filing,
-           observed_at,
-           top_n_holders,
-           top_n_at_cap,
-           holders_at_latest,
-           holders_lagging,
-           net_change_shares,
-           prior_shares_at_latest,
-           net_change_pct,
-           top_n_pct_of_shares_out,
-           largest_holder_pct,
-           n_added, n_trimmed, n_initiated, n_unchanged
-      FROM inst_flow_ticker
+# Shared column projection, so the floors/flags code downstream is identical
+# regardless of source. The banked source adds banked_at and the as_of filter.
+_COLS = """ticker, latest_filing, observed_at,
+           top_n_holders, top_n_at_cap, holders_at_latest, holders_lagging,
+           net_change_shares, prior_shares_at_latest, net_change_pct,
+           top_n_pct_of_shares_out, largest_holder_pct,
+           n_added, n_trimmed, n_initiated, n_unchanged"""
+
+# Live fallback: the single current vintage.
+_LIVE_SQL = f"SELECT {_COLS} FROM inst_flow_ticker WHERE ticker = %s"
+
+# Point-in-time: the latest vintage the system had stored by as_of.
+_BANKED_SQL = f"""
+    SELECT {_COLS}, banked_at
+      FROM inst_flow_vintage
      WHERE ticker = %s
+       AND banked_at <= %s
+  ORDER BY banked_at DESC
+     LIMIT 1
 """
+
+_ANY_VINTAGE_SQL = "SELECT 1 FROM inst_flow_vintage WHERE ticker = %s LIMIT 1"
 
 
 class InstitutionalFlowStrategy:
     """Net institutional share-count change at the latest filing date, as a
-    per-ticker signal. Conforms to core.contract.Strategy."""
+    per-ticker signal. Conforms to core.contract.Strategy.
+
+    Reuse one instance across tickers -- vintage-table availability is detected
+    once and cached."""
 
     name = "institutional_flow"
 
+    def __init__(self) -> None:
+        self._use_v = _UNSET  # resolved on first evaluate()
+
+    # -- source selection (once per instance) -----------------------------
+    def _use_vintage(self, ctx: Context) -> bool:
+        """True iff inst_flow_vintage exists AND holds at least one row. Empty
+        or absent -> fall back to the live rollup, so a freshly-migrated but
+        not-yet-banked database still serves live picks."""
+        if self._use_v is not _UNSET:
+            return self._use_v
+        exists = ctx.fetch_all(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_name = 'inst_flow_vintage'", None)
+        if not exists:
+            self._use_v = False
+        else:
+            self._use_v = bool(ctx.fetch_all("SELECT 1 FROM inst_flow_vintage LIMIT 1", None))
+        return self._use_v
+
+    # -- the contract -----------------------------------------------------
     def evaluate(self, ticker: str, as_of: date, ctx: Context) -> Signal:
-        rows = ctx.fetch_all(_VINTAGE_SQL, (ticker,))
-        if not rows:
-            return Signal.excluded(as_of, "not_covered")
-        row = rows[0]
+        if self._use_vintage(ctx):
+            rows = ctx.fetch_all(_BANKED_SQL, (ticker, as_of))
+            if not rows:
+                # No vintage stored by as_of. Distinguish "we never covered this
+                # ticker" from "we hadn't banked one yet by that date".
+                covered = ctx.fetch_all(_ANY_VINTAGE_SQL, (ticker,))
+                return Signal.excluded(as_of,
+                                       "no_vintage_as_of" if covered else "not_covered")
+            row = rows[0]
+            know = _as_date(row["banked_at"])
+            know_kind = "banked_at"
+        else:
+            rows = ctx.fetch_all(_LIVE_SQL, (ticker,))
+            if not rows:
+                return Signal.excluded(as_of, "not_covered")
+            row = rows[0]
+            know = _as_date(row["observed_at"])
+            know_kind = "observed_at"
+            # Live fallback keeps the original prospective-only gate: the one
+            # snapshot we hold is only knowable from when it was observed.
+            if know is None or know > as_of:
+                return Signal.excluded(
+                    as_of, "no_vintage_as_of",
+                    earliest_observed=know.isoformat() if know else None)
 
-        # ---- 1. no-look-ahead gate --------------------------------------
-        observed = _as_date(row["observed_at"])
-        if observed is None or observed > as_of:
-            # We hold no vintage observed on or before as_of. Refuse to invent
-            # one. This is what makes the signal prospective-only in practice.
-            return Signal.excluded(
-                as_of, "no_vintage_as_of",
-                earliest_observed=observed.isoformat() if observed else None,
-            )
-
-        # ---- 2. data-validity floors ------------------------------------
+        # ---- data-validity floors ---------------------------------------
         # net_change_pct is NULL when there are too few current filers for the
         # delta to mean anything (the view's own guard); treat as no reading.
         net = _f(row["net_change_pct"])
@@ -107,19 +148,21 @@ class InstitutionalFlowStrategy:
             return Signal.excluded(as_of, "below_min_prior_shares",
                                    prior_shares_at_latest=prior_shares)
 
-        # ---- 3. carry the caveats, do not launder them ------------------
+        # ---- carry the caveats, do not launder them ---------------------
         at_cap = bool(row["top_n_at_cap"])
-        # The view's bias_note in structured form: at the cap, exits and
-        # rank-20 drop-offs delete only *negative* flow, so a negative reading
-        # is a lower bound on selling, not a point estimate.
+        # The view's bias_note in structured form: at the cap, exits and rank-20
+        # drop-offs delete only *negative* flow, so a negative reading is a lower
+        # bound on selling, not a point estimate.
         lower_bound = at_cap and net < 0
 
+        observed = _as_date(row["observed_at"])
         flags = {
             "top_n_at_cap": at_cap,
             "reading_is_lower_bound": lower_bound,
             "holders_at_latest": holders_at_latest,
             "holders_lagging": int(row["holders_lagging"] or 0),
-            "stale_days": (as_of - observed).days,
+            "knowability": know_kind,      # banked_at (PIT) or observed_at (live)
+            "stale_days": (as_of - know).days if know else None,
             "latest_filing": _iso(row["latest_filing"]),
         }
         detail = {
@@ -133,8 +176,10 @@ class InstitutionalFlowStrategy:
             "n_trimmed": int(row["n_trimmed"] or 0),
             "n_initiated": int(row["n_initiated"] or 0),
             "n_unchanged": int(row["n_unchanged"] or 0),
-            "observed_at": observed.isoformat(),
+            "observed_at": observed.isoformat() if observed else None,
         }
+        if know_kind == "banked_at":
+            detail["banked_at"] = know.isoformat()
         return Signal(value=net, as_of=as_of, flags=flags, detail=detail)
 
 
