@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
-"""Autonomous Stock Explorer - Main Agent"""
+"""Autonomous Stock Explorer - Main Agent.
+
+Runs the explorer's SQL strategies, cross-references multi-signal tickers, and
+hands grounded facts to the LLM for a report.
+
+Merged into the eodhd repo: the old self-contained `database.py` pool is gone;
+this now reads through the shared `db.py` (read-only role via config.ro_dsn).
+Run from the repo root:  python -m explorer.runner
+"""
+from __future__ import annotations
+
 import json
 import math
 import random
-import sys
 from datetime import datetime, date
 from decimal import Decimal
 from pathlib import Path
-from collections import Counter
+
 import pandas as pd
 from loguru import logger
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
-from dotenv import load_dotenv
 
-from database import DatabaseConnector
-from llm import LLMInterface
-from strategies import STRATEGIES
+import db
+from config import settings
+from .llm import LLMInterface
+from .sql_strategies import STRATEGIES
 
-load_dotenv('config/.env')
 console = Console()
 
 
@@ -54,7 +62,7 @@ def _fnum(v):
     return None if math.isnan(f) else f
 
 
-def build_facts(db, top_tickers):
+def build_facts(top_tickers):
     """Deterministically gather facts for the top conviction tickers straight
     from the database -- name, sector, latest price, and a few key metrics.
 
@@ -66,9 +74,8 @@ def build_facts(db, top_tickers):
         return []
 
     tickers = [t for t, _ in top_tickers]
-    rows = []
     try:
-        _, rows = db.execute(
+        rows = db.fetch_all(
             """
             SELECT f.ticker, f.name, f.sector, f.industry, f.market_cap,
                    f.pe_ratio, f.return_on_equity, f.profit_margin,
@@ -108,14 +115,36 @@ def build_facts(db, top_tickers):
     return facts
 
 
+def _universe_banner():
+    """Cheap replacement for the old connector's get_schema/get_table_stats --
+    a startup banner and the universe size, via information_schema + a count.
+    Returns (n_tables, universe_size)."""
+    n_tables = None
+    universe_size = None
+    try:
+        rows = db.fetch_all(
+            "SELECT count(*) AS n FROM information_schema.tables "
+            "WHERE table_schema = 'public'"
+        )
+        n_tables = rows[0]["n"] if rows else None
+    except Exception as exc:
+        logger.warning(f"table count failed ({exc})")
+    try:
+        row = db.fetch_one("SELECT count(*) AS n FROM fundamentals")
+        universe_size = row["n"] if row else None
+    except Exception as exc:
+        logger.warning(f"universe size failed ({exc})")
+    return n_tables, universe_size
+
+
 class StockExplorer:
     def __init__(self):
-        self.db = DatabaseConnector()
         self.llm = LLMInterface()
         self.findings = []
         self.start_time = datetime.now()
         self.universe_size = None
 
+        Path("logs").mkdir(exist_ok=True)
         logger.add("logs/agent_{time}.log", rotation="1 day", retention="7 days")
 
     def run(self):
@@ -124,18 +153,15 @@ class StockExplorer:
         console.print(f"[dim]Start time: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}[/dim]")
 
         try:
-            self.db.connect()
-
-            schema = self.db.get_schema()
-            stats = self.db.get_table_stats()
-            total_rows = sum(s['row_count'] for s in stats)
-            self.universe_size = next(
-                (s['row_count'] for s in stats if s['table_name'] == 'fundamentals'), None
+            # Reads run through the shared read-only pool; nothing to open/close.
+            n_tables, self.universe_size = _universe_banner()
+            console.print(
+                f"[green]✓[/green] Connected via db.py "
+                f"({n_tables if n_tables is not None else '?'} tables, "
+                f"universe {self.universe_size:,} names)"
+                if self.universe_size is not None else
+                f"[green]✓[/green] Connected via db.py"
             )
-            console.print(f"[green]✓[/green] Connected: {len(schema)} tables, {total_rows:,} total rows")
-
-            for s in stats[:10]:
-                console.print(f"  [dim]• {s['table_name']}: {s['row_count']:,} rows[/dim]")
 
             with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
                 task = progress.add_task("[cyan]Executing investment strategies...", total=len(STRATEGIES) * 3)
@@ -147,10 +173,10 @@ class StockExplorer:
 
                         try:
                             query = strategy['query'].format(**params)
-                            columns, rows = self.db.execute(query)
+                            rows = db.fetch_all(query)
 
                             if rows:
-                                df = pd.DataFrame(rows, columns=columns)
+                                df = pd.DataFrame(rows)   # rows are dicts -> columns inferred
                                 interpretation = self.llm.interpret_results(
                                     f"Strategy: {strategy_name} (variation {i+1})",
                                     df
@@ -194,7 +220,7 @@ class StockExplorer:
                     console.print(f"  [cyan]🔍 {ticker}[/cyan] - {len(signals)} signals: {', '.join(signals)}")
 
             # Deterministic facts for the conviction picks (authoritative names/numbers)
-            facts = build_facts(self.db, top_tickers)
+            facts = build_facts(top_tickers)
 
             self.save_results(all_results, multi_signal, top_tickers, facts)
 
@@ -210,11 +236,10 @@ class StockExplorer:
         except Exception as e:
             logger.error(f"Fatal error: {e}", exc_info=True)
             console.print(f"[red]Fatal: {e}[/red]")
-        finally:
-            self.db.close()
 
     def save_results(self, results, multi_signal, top_tickers, facts):
         """Save raw findings"""
+        Path("findings").mkdir(exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
         output = {
@@ -241,7 +266,7 @@ class StockExplorer:
             json.dump(output, f, indent=2, default=str)
 
         latest = Path("findings/latest_results.json")
-        if latest.exists():
+        if latest.exists() or latest.is_symlink():
             latest.unlink()
         latest.symlink_to(f"results_{timestamp}.json")
 
@@ -249,13 +274,14 @@ class StockExplorer:
 
     def save_report(self, report):
         """Save markdown report"""
+        Path("findings").mkdir(exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
         with open(f"findings/report_{timestamp}.md", 'w') as f:
-            f.write(f"# Investment Research Report\n")
+            f.write("# Investment Research Report\n")
             f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             f.write(report)
-            f.write(f"\n\n---\n*Report generated by Stock Explorer Agent on MS-A1*\n")
+            f.write("\n\n---\n*Report generated by Stock Explorer Agent on MS-A1*\n")
 
 
 if __name__ == "__main__":
