@@ -15,5 +15,6 @@ plotly==6.9.0
 # explorer
 ollama==0.1.9
 loguru==0.7.3
+json_repair==0.30.0
 rich==15.0.0
 pypandoc==1.17

@@ -1,0 +1,34 @@
+[Unit]
+Description=Stock Explorer Agent (autonomous LLM exploration -> morning report)
+After=network-online.target postgresql.service ollama.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jon
+Group=jon
+WorkingDirectory=/home/jon/eodhd
+Environment=PYTHONUNBUFFERED=1
+
+# Read-only DB identity: the explorer must never write. This pins the whole
+# process to the read-only role at the database level (matches the grant
+# boundary: jon writes, ai_agent reads). config.py also exposes ro_dsn if you
+# later split db.py into writer/reader pools.
+Environment=PG_USER=ai_agent
+
+# .env in the repo root supplies PG_PASSWORD (for ai_agent here), OLLAMA_HOST,
+# EXPLORATION_MODEL, ANALYSIS_MODEL, SMTP_*, etc. config.py loads it on import.
+# If you prefer, point at it explicitly instead of relying on WorkingDirectory:
+# EnvironmentFile=/home/jon/eodhd/.env
+
+ExecStart=/home/jon/eodhd/venv/bin/python -m explorer.runner
+
+# Generate + email the morning report right after exploration finishes.
+# Drop this line if morning_report.bash / a separate unit already does it.
+ExecStartPost=/home/jon/eodhd/venv/bin/python -m explorer.morning_report
+
+Nice=10
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target

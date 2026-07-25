@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Stock Explorer Agent daily before the morning report
+
+[Timer]
+# Your crontab ran morning_report.bash at 07:01. If the systemd unit now OWNS
+# exploration + report, schedule it earlier so the report is fresh by 07:00 --
+# exploration is LLM-bound and can take a while. Adjust to taste.
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
