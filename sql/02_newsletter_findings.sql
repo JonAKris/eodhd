@@ -1,0 +1,411 @@
+-- =====================================================================
+-- 02_newsletter_findings.sql   (REVISION 2)
+--
+-- The contract between SQL and the LLM. Every number that may appear in
+-- the newsletter is computed here and stored in newsletter_findings.facts.
+-- The LLM reads this table and narrates it. No DB access, no arithmetic.
+--
+-- CHANGES FROM REVISION 1
+--   * inst_accumulation / inst_distribution read EODHD's per-holder
+--     `change` via inst_flow_ticker, not a reconstructed snapshot diff.
+--   * No 'exited' anywhere. Exits are unobservable in this data source
+--     (the payload lists current holders only). Rev 1 would have printed
+--     fabricated exit counts.
+--   * interval_days filters are gone -- there is no interval, because
+--     there are no snapshot pairs.
+--   * Ownership figures are labelled top_n_*, because the payload caps
+--     holders per ticker (20 in the sample). They are NOT total
+--     institutional ownership.
+--   * New section: inst_ownership. Concentration and conviction, which
+--     need no history and work at launch.
+--
+-- Run after 00_fix_holders.sql and 01_metrics_views.sql.
+-- =====================================================================
+
+DROP TABLE IF EXISTS newsletter_config CASCADE;
+
+CREATE TABLE newsletter_config (
+    key   text PRIMARY KEY,
+    value numeric NOT NULL,
+    note  text
+);
+
+INSERT INTO newsletter_config (key, value, note) VALUES
+  ('min_price',        5.00,   'Exclude sub-$5 names from movers/breadth'),
+  ('min_avg_vol_20d',  100000, 'Liquidity floor. Without it, movers is microcap noise'),
+  ('min_holders',      5,      'Top-N holders required for a ticker to be rankable'),
+  ('min_prior_shares', 50000,  'Baseline floor. EODHD change_p hits +1342% on a 23k base'),
+  ('min_holders_at_latest', 4, 'Net flow needs enough current filers to mean anything'),
+  ('top_n',            5,      'Rows per section');
+
+CREATE OR REPLACE FUNCTION cfg(p_key text) RETURNS numeric
+LANGUAGE sql STABLE AS $$
+    SELECT value FROM newsletter_config WHERE key = p_key;
+$$;
+
+
+DROP TABLE IF EXISTS newsletter_findings CASCADE;
+
+CREATE TABLE newsletter_findings (
+    id         bigserial PRIMARY KEY,
+    issue_date date   NOT NULL,
+    section    text   NOT NULL,
+    rank       int    NOT NULL,
+    ticker     text,
+    headline   text   NOT NULL,
+    facts      jsonb  NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (issue_date, section, rank)
+);
+
+CREATE INDEX newsletter_findings_issue_idx ON newsletter_findings (issue_date, section, rank);
+
+
+CREATE OR REPLACE FUNCTION build_newsletter(p_issue_date date DEFAULT CURRENT_DATE)
+RETURNS integer
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_count      integer;
+    v_price_asof date;
+    v_inst_asof  date;
+BEGIN
+    DELETE FROM newsletter_findings WHERE issue_date = p_issue_date;
+
+    SELECT max(as_of)        INTO v_price_asof FROM price_perf;
+    SELECT max(latest_filing) INTO v_inst_asof FROM inst_flow_ticker;
+
+    -- ================= provenance =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'provenance', 1, NULL,
+        format('Prices as of %s. Institutional positions reflect filings dated up to %s, %s days before publication.',
+               v_price_asof, v_inst_asof, (p_issue_date - v_inst_asof)),
+        jsonb_build_object(
+            'issue_date',             p_issue_date,
+            'price_as_of',            v_price_asof,
+            'institutional_as_of',    v_inst_asof,
+            'institutional_lag_days', (p_issue_date - v_inst_asof),
+            'universe_size',          (SELECT count(*) FROM price_perf),
+            'holders_universe_size',  (SELECT count(*) FROM inst_flow_ticker),
+            'analyst_ratings_rows',   (SELECT count(*) FROM analyst_ratings_history),
+            'holder_coverage_note',
+              'Holder data covers each ticker''s largest reported holders only, not every holder.',
+            'exit_note',
+              'Positions closed entirely are not reported by the data source and are not counted.'
+        );
+
+    -- ================= market_breadth =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'market_breadth', 1, NULL,
+        format('Of %s liquid names in the covered universe, %s advanced and %s declined; median move %s%%.',
+               b.total, b.advancers, b.decliners, b.median_ret_1d),
+        jsonb_build_object(
+            'scope',        'institutional-holdings universe, liquidity-filtered',
+            'scope_caveat', 'This is not an index. It is a breadth measure over covered names.',
+            'as_of', v_price_asof,
+            'total', b.total, 'advancers', b.advancers, 'decliners', b.decliners,
+            'unchanged', b.unchanged, 'advance_decline_ratio', b.ad_ratio,
+            'median_ret_1d', b.median_ret_1d, 'median_ret_5d', b.median_ret_5d,
+            'median_ret_1m', b.median_ret_1m, 'pct_above_zero_12m', b.pct_pos_12m)
+    FROM (
+        SELECT count(*) AS total,
+            count(*) FILTER (WHERE ret_1d > 0) AS advancers,
+            count(*) FILTER (WHERE ret_1d < 0) AS decliners,
+            count(*) FILTER (WHERE ret_1d = 0) AS unchanged,
+            CASE WHEN count(*) FILTER (WHERE ret_1d < 0) = 0 THEN NULL
+                 ELSE round(count(*) FILTER (WHERE ret_1d > 0)::numeric
+                          / count(*) FILTER (WHERE ret_1d < 0), 2) END AS ad_ratio,
+            round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ret_1d)::numeric, 2) AS median_ret_1d,
+            round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ret_5d)::numeric, 2) AS median_ret_5d,
+            round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ret_1m)::numeric, 2) AS median_ret_1m,
+            round(100.0 * count(*) FILTER (WHERE ret_12m > 0)
+                  / NULLIF(count(*) FILTER (WHERE ret_12m IS NOT NULL), 0), 1) AS pct_pos_12m
+        FROM price_perf
+        WHERE ret_1d IS NOT NULL
+          AND close >= cfg('min_price') AND avg_vol_20d >= cfg('min_avg_vol_20d')
+    ) b
+    WHERE b.total > 0;
+
+    -- ================= movers_up =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'movers_up',
+        row_number() OVER (ORDER BY p.ret_1d DESC), p.ticker,
+        format('%s (%s) +%s%% on %sx average volume.',
+               COALESCE(f.name, p.ticker), p.ticker, p.ret_1d, COALESCE(p.vol_ratio, 0)),
+        jsonb_build_object('ticker', p.ticker, 'name', f.name, 'sector', f.sector,
+            'as_of', p.as_of, 'close', p.close, 'ret_1d', p.ret_1d, 'ret_5d', p.ret_5d,
+            'ret_1m', p.ret_1m, 'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'volume', p.volume, 'avg_vol_20d', p.avg_vol_20d, 'vol_ratio', p.vol_ratio,
+            'market_cap', f.market_cap)
+    FROM price_perf p
+    LEFT JOIN fundamentals f ON f.ticker = p.ticker
+    WHERE p.ret_1d > 0                 -- empty section beats a mislabelled one
+      AND p.close >= cfg('min_price') AND p.avg_vol_20d >= cfg('min_avg_vol_20d')
+    ORDER BY p.ret_1d DESC LIMIT cfg('top_n')::int;
+
+    -- ================= movers_down =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'movers_down',
+        row_number() OVER (ORDER BY p.ret_1d ASC), p.ticker,
+        format('%s (%s) %s%% on %sx average volume.',
+               COALESCE(f.name, p.ticker), p.ticker, p.ret_1d, COALESCE(p.vol_ratio, 0)),
+        jsonb_build_object('ticker', p.ticker, 'name', f.name, 'sector', f.sector,
+            'as_of', p.as_of, 'close', p.close, 'ret_1d', p.ret_1d, 'ret_5d', p.ret_5d,
+            'ret_1m', p.ret_1m, 'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'volume', p.volume, 'avg_vol_20d', p.avg_vol_20d, 'vol_ratio', p.vol_ratio,
+            'market_cap', f.market_cap)
+    FROM price_perf p
+    LEFT JOIN fundamentals f ON f.ticker = p.ticker
+    WHERE p.ret_1d < 0
+      AND p.close >= cfg('min_price') AND p.avg_vol_20d >= cfg('min_avg_vol_20d')
+    ORDER BY p.ret_1d ASC LIMIT cfg('top_n')::int;
+
+    -- ================= inst_accumulation =================
+    -- Reads EODHD's own per-holder change. No exit counts: unobservable.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'inst_accumulation',
+        row_number() OVER (ORDER BY t.net_change_pct DESC), t.ticker,
+        format('%s (%s): reported institutional share count rose %s%% at the %s filing date. %s holders added, %s initiated new positions, %s left unchanged.',
+               COALESCE(f.name, t.ticker), t.ticker, t.net_change_pct,
+               t.latest_filing, t.n_added, t.n_initiated, t.n_unchanged),
+        jsonb_build_object(
+            'ticker', t.ticker, 'name', f.name, 'sector', f.sector,
+            'latest_filing', t.latest_filing,
+            'holders_at_latest', t.holders_at_latest,
+            'holders_lagging',   t.holders_lagging,
+            'net_change_shares', t.net_change_shares,
+            'net_change_pct',    t.net_change_pct,
+            'prior_shares_at_latest', t.prior_shares_at_latest,
+            'top_n_holders', t.top_n_holders,
+            'top_n_pct_of_shares_out', t.top_n_pct_of_shares_out,
+            'top_n_at_cap', t.top_n_at_cap,
+            'coverage_note', 'Covers the largest reported holders only. Not total institutional ownership.',
+            'bias_note', 'Where the holder list is capped, holders that exited or fell out of the largest-holder list are not reported, so reductions are undercounted. This figure understates selling.',
+            'n_added', t.n_added, 'n_trimmed', t.n_trimmed,
+            'n_initiated', t.n_initiated, 'n_unchanged', t.n_unchanged,
+            'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'top_movers', (
+                SELECT jsonb_agg(x) FROM (
+                    SELECT jsonb_build_object('holder', i.holder_name, 'action', i.action,
+                        'change_shares', i.change_shares, 'change_pct', i.change_pct_clean,
+                        'shares_held', i.shares_held,
+                        'pct_of_holder_portfolio', i.pct_assets) AS x
+                    FROM inst_flow i
+                    WHERE i.ticker = t.ticker AND i.report_date = t.latest_filing
+                      AND i.action IN ('added','initiated')
+                    ORDER BY i.change_shares DESC LIMIT 3
+                ) s))
+    FROM inst_flow_ticker t
+    LEFT JOIN fundamentals f ON f.ticker = t.ticker
+    LEFT JOIN price_perf   p ON p.ticker = t.ticker
+    WHERE t.net_change_pct IS NOT NULL
+      AND t.top_n_holders          >= cfg('min_holders')
+      AND t.holders_at_latest      >= cfg('min_holders_at_latest')
+      AND t.prior_shares_at_latest >= cfg('min_prior_shares')
+    ORDER BY t.net_change_pct DESC LIMIT cfg('top_n')::int;
+
+    -- ================= inst_distribution =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'inst_distribution',
+        row_number() OVER (ORDER BY t.net_change_pct ASC), t.ticker,
+        format('%s (%s): reported institutional share count fell %s%% at the %s filing date. %s holders trimmed, %s added, %s left unchanged.',
+               COALESCE(f.name, t.ticker), t.ticker, abs(t.net_change_pct),
+               t.latest_filing, t.n_trimmed, t.n_added, t.n_unchanged),
+        jsonb_build_object(
+            'ticker', t.ticker, 'name', f.name, 'sector', f.sector,
+            'latest_filing', t.latest_filing,
+            'holders_at_latest', t.holders_at_latest,
+            'holders_lagging',   t.holders_lagging,
+            'net_change_shares', t.net_change_shares,
+            'net_change_pct',    t.net_change_pct,
+            'prior_shares_at_latest', t.prior_shares_at_latest,
+            'top_n_holders', t.top_n_holders,
+            'top_n_pct_of_shares_out', t.top_n_pct_of_shares_out,
+            'top_n_at_cap', t.top_n_at_cap,
+            'coverage_note', 'Covers the largest reported holders only. Positions closed entirely are not reported.',
+            'bias_note', 'This is a lower bound on selling. Holders that exited or fell out of the largest-holder list are not reported, so the actual reduction is at least this large and probably larger.',
+            'n_added', t.n_added, 'n_trimmed', t.n_trimmed,
+            'n_initiated', t.n_initiated, 'n_unchanged', t.n_unchanged,
+            'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'top_movers', (
+                SELECT jsonb_agg(x) FROM (
+                    SELECT jsonb_build_object('holder', i.holder_name, 'action', i.action,
+                        'change_shares', i.change_shares, 'change_pct', i.change_pct_clean,
+                        'shares_held', i.shares_held,
+                        'pct_of_holder_portfolio', i.pct_assets) AS x
+                    FROM inst_flow i
+                    WHERE i.ticker = t.ticker AND i.report_date = t.latest_filing
+                      AND i.action = 'trimmed'
+                    ORDER BY i.change_shares ASC LIMIT 3
+                ) s))
+    FROM inst_flow_ticker t
+    LEFT JOIN fundamentals f ON f.ticker = t.ticker
+    LEFT JOIN price_perf   p ON p.ticker = t.ticker
+    WHERE t.net_change_pct IS NOT NULL
+      AND t.top_n_holders          >= cfg('min_holders')
+      AND t.holders_at_latest      >= cfg('min_holders_at_latest')
+      AND t.prior_shares_at_latest >= cfg('min_prior_shares')
+    ORDER BY t.net_change_pct ASC LIMIT cfg('top_n')::int;
+
+    -- ================= inst_ownership =================
+    -- NEW in rev 2. Concentration and conviction. Needs no history, no
+    -- deltas, no snapshots. Works at launch and is not affected by any
+    -- of the four data traps except top-N truncation, which is labelled.
+    --
+    -- pct_assets = share of the HOLDER's own portfolio in this name.
+    -- A high value is a conviction signal and is cross-sectional, not
+    -- temporal, so it is immune to the whole snapshot problem.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'inst_ownership',
+        row_number() OVER (ORDER BY t.max_holder_conviction_pct DESC), t.ticker,
+        format('%s (%s): %s reported institutional holders; largest holds %s%% of shares outstanding. One holder allocates %s%% of its own portfolio to the position.',
+               COALESCE(f.name, t.ticker), t.ticker, t.top_n_holders,
+               t.largest_holder_pct, t.max_holder_conviction_pct),
+        jsonb_build_object(
+            'ticker', t.ticker, 'name', f.name, 'sector', f.sector,
+            'latest_filing', t.latest_filing,
+            'top_n_holders', t.top_n_holders,
+            'top_n_pct_of_shares_out', t.top_n_pct_of_shares_out,
+            'largest_holder_pct', t.largest_holder_pct,
+            'max_holder_conviction_pct', t.max_holder_conviction_pct,
+            'top_n_at_cap', t.top_n_at_cap,
+            'coverage_note', 'Covers the largest reported holders only, not every institutional holder.',
+            'conviction_selection_note', 'The largest-holder list is ranked by position size, not by conviction. A small holder with a very concentrated position may be absent. This is the most concentrated among reported holders, not necessarily overall.',
+            'conviction_note', 'Portfolio allocation is the share of that holder''s own reported portfolio in this security.',
+            'ret_3m', p.ret_3m, 'ret_12m', p.ret_12m,
+            'most_concentrated', (
+                SELECT jsonb_agg(x) FROM (
+                    SELECT jsonb_build_object('holder', i.holder_name,
+                        'pct_of_holder_portfolio', i.pct_assets,
+                        'pct_of_shares_out', i.pct_shares,
+                        'shares_held', i.shares_held) AS x
+                    FROM inst_flow i
+                    WHERE i.ticker = t.ticker AND i.pct_assets IS NOT NULL
+                    ORDER BY i.pct_assets DESC LIMIT 3
+                ) s))
+    FROM inst_flow_ticker t
+    LEFT JOIN fundamentals f ON f.ticker = t.ticker
+    LEFT JOIN price_perf   p ON p.ticker = t.ticker
+    WHERE t.max_holder_conviction_pct IS NOT NULL
+      AND t.top_n_holders >= cfg('min_holders')
+    ORDER BY t.max_holder_conviction_pct DESC LIMIT cfg('top_n')::int;
+
+    -- ================= fund_flow_notable =================
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'fund_flow_notable',
+        row_number() OVER (ORDER BY abs(t.net_change_pct) DESC), t.ticker,
+        format('%s (%s): fund-held shares %s %s%% across %s reported funds filing between %s and %s.',
+               COALESCE(f.name, t.ticker), t.ticker,
+               CASE WHEN t.net_change_pct >= 0 THEN 'rose' ELSE 'fell' END,
+               abs(t.net_change_pct), t.funds_in_window,
+               t.window_earliest_filing, t.latest_filing),
+        jsonb_build_object('ticker', t.ticker, 'name', f.name, 'sector', f.sector,
+            'latest_filing', t.latest_filing,
+            'window_earliest_filing', t.window_earliest_filing,
+            'filing_span_days', t.filing_span_days,
+            'top_n_funds', t.top_n_funds,
+            'funds_in_window', t.funds_in_window, 'funds_stale', t.funds_stale,
+            'net_change_shares', t.net_change_shares,
+            'net_change_pct', t.net_change_pct,
+            'prior_shares_in_window', t.prior_shares_in_window,
+            'top_n_pct_of_shares_out', t.top_n_pct_of_shares_out,
+            'coverage_note', 'Covers the largest reported fund holders only.',
+            'asynchrony_note', 'Funds report on staggered month-ends. Each change is measured against that fund''s own prior report, so this aggregates across different reporting periods.',
+            'n_initiated', t.n_initiated, 'n_added', t.n_added, 'n_trimmed', t.n_trimmed)
+    FROM fund_flow_ticker t
+    LEFT JOIN fundamentals f ON f.ticker = t.ticker
+    WHERE t.net_change_pct IS NOT NULL
+      AND t.top_n_funds            >= cfg('min_holders')
+      AND t.funds_in_window        >= 3
+      AND t.prior_shares_in_window >= cfg('min_prior_shares')
+    ORDER BY abs(t.net_change_pct) DESC LIMIT cfg('top_n')::int;
+
+    -- ================= insider_activity =================
+    -- Codes P and S only. A/M/G are grants, option exercises and gifts:
+    -- compensation events, not conviction.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'insider_activity',
+        row_number() OVER (ORDER BY abs(agg.net_value) DESC), agg.ticker,
+        format('%s (%s): %s open-market insider %s across %s %s over the last 30 days, net %s of $%s.',
+               COALESCE(f.name, agg.ticker), agg.ticker, agg.n_txns,
+               CASE WHEN agg.n_txns = 1 THEN 'transaction' ELSE 'transactions' END,
+               agg.n_insiders,
+               CASE WHEN agg.n_insiders = 1 THEN 'insider' ELSE 'insiders' END,
+               CASE WHEN agg.net_value >= 0 THEN 'buying' ELSE 'selling' END,
+               to_char(abs(agg.net_value), 'FM999,999,999,990')),
+        jsonb_build_object('ticker', agg.ticker, 'name', f.name, 'sector', f.sector,
+            'window_days', 30, 'n_txns', agg.n_txns,
+            'n_buys', agg.n_buys, 'n_sells', agg.n_sells, 'n_insiders', agg.n_insiders,
+            'buy_value', agg.buy_value, 'sell_value', agg.sell_value,
+            'net_value', agg.net_value, 'earliest', agg.earliest, 'latest', agg.latest)
+    FROM (
+        SELECT it.ticker, count(*) AS n_txns,
+            count(*) FILTER (WHERE it.transaction_code='P') AS n_buys,
+            count(*) FILTER (WHERE it.transaction_code='S') AS n_sells,
+            count(DISTINCT it.owner_name) AS n_insiders,
+            COALESCE(sum(it.value) FILTER (WHERE it.transaction_code='P'),0) AS buy_value,
+            COALESCE(sum(it.value) FILTER (WHERE it.transaction_code='S'),0) AS sell_value,
+            COALESCE(sum(it.value) FILTER (WHERE it.transaction_code='P'),0)
+              - COALESCE(sum(it.value) FILTER (WHERE it.transaction_code='S'),0) AS net_value,
+            min(it.transaction_date) AS earliest, max(it.transaction_date) AS latest
+        FROM insider_transactions it
+        WHERE it.transaction_code IN ('P','S')
+          AND it.transaction_date >= (p_issue_date - INTERVAL '30 days')
+          AND it.value IS NOT NULL
+        GROUP BY it.ticker HAVING count(*) >= 2
+    ) agg
+    LEFT JOIN fundamentals f ON f.ticker = agg.ticker
+    ORDER BY abs(agg.net_value) DESC LIMIT cfg('top_n')::int;
+
+    -- ================= analyst_consensus =================
+    -- Empty until the flatten cron has run on two distinct dates.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'analyst_consensus',
+        row_number() OVER (ORDER BY abs(d.drift) DESC), d.ticker,
+        format('%s (%s): consensus rating moved from %s to %s between %s and %s (scale: 5 = strong buy).',
+               COALESCE(f.name, d.ticker), d.ticker, d.prev_rating, d.curr_rating,
+               d.prev_date, d.curr_date),
+        jsonb_build_object('ticker', d.ticker, 'name', f.name, 'sector', f.sector,
+            'scale_note', '5 = strong buy, 1 = strong sell. Rising rating = improving consensus.',
+            'curr_date', d.curr_date, 'prev_date', d.prev_date,
+            'curr_rating', d.curr_rating, 'prev_rating', d.prev_rating, 'drift', d.drift,
+            'curr_target_price', d.curr_target, 'prev_target_price', d.prev_target,
+            'close', p.close,
+            'target_vs_close_pct',
+                CASE WHEN p.close > 0 THEN round((d.curr_target/p.close - 1)*100.0, 2) END,
+            'strong_buy', d.strong_buy, 'buy', d.buy, 'hold', d.hold,
+            'sell', d.sell, 'strong_sell', d.strong_sell)
+    FROM (
+        SELECT c.ticker, c.date AS curr_date, pr.date AS prev_date,
+            c.rating AS curr_rating, pr.rating AS prev_rating,
+            round(c.rating - pr.rating, 4) AS drift,
+            c.target_price AS curr_target, pr.target_price AS prev_target,
+            c.strong_buy, c.buy, c.hold, c.sell, c.strong_sell
+        FROM (SELECT DISTINCT ON (ticker) * FROM analyst_ratings_history
+              WHERE rating IS NOT NULL ORDER BY ticker, date DESC) c
+        JOIN LATERAL (
+            SELECT * FROM analyst_ratings_history a
+            WHERE a.ticker = c.ticker AND a.date < c.date AND a.rating IS NOT NULL
+            ORDER BY a.date DESC LIMIT 1) pr ON true
+        WHERE abs(c.rating - pr.rating) >= 0.05
+    ) d
+    LEFT JOIN fundamentals f ON f.ticker = d.ticker
+    LEFT JOIN price_perf   p ON p.ticker = d.ticker
+    ORDER BY abs(d.drift) DESC LIMIT cfg('top_n')::int;
+
+    SELECT count(*) INTO v_count FROM newsletter_findings WHERE issue_date = p_issue_date;
+    RETURN v_count;
+END;
+$$;
+
+
+CREATE OR REPLACE FUNCTION newsletter_payload(p_issue_date date DEFAULT CURRENT_DATE)
+RETURNS jsonb
+LANGUAGE sql STABLE AS $$
+    SELECT jsonb_object_agg(section, items)
+    FROM (
+        SELECT section,
+               jsonb_agg(jsonb_build_object('rank', rank, 'headline', headline, 'facts', facts)
+                         ORDER BY rank) AS items
+        FROM newsletter_findings WHERE issue_date = p_issue_date GROUP BY section
+    ) s;
+$$;

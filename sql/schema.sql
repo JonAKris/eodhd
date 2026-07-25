@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict DNXS9lbKgkZGdyNb9WLkhOs7ifRDzgqbXv1H4AhEf0Os6vH7gaKnQLrTCs7cofc
+\restrict KtC0bvjyrNf5ahEbmRdKuSQ7Uc3RKOxaxO0I0ZiV5Bnx8jnqdIxZETV9WsL4SHs
 
 -- Dumped from database version 16.14 (Ubuntu 16.14-1.pgdg24.04+1)
 -- Dumped by pg_dump version 16.14 (Ubuntu 16.14-1.pgdg24.04+1)
@@ -59,6 +59,58 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
 
 COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
 
+
+--
+-- Name: bank_flow_vintages(); Type: FUNCTION; Schema: public; Owner: jon
+--
+
+CREATE FUNCTION public.bank_flow_vintages() RETURNS TABLE(inst_banked integer, fund_banked integer)
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_inst integer;
+    v_fund integer;
+BEGIN
+    INSERT INTO inst_flow_vintage
+    SELECT CURRENT_DATE, t.*
+    FROM inst_flow_ticker t
+    LEFT JOIN LATERAL (
+        SELECT * FROM inst_flow_vintage v
+        WHERE v.ticker = t.ticker
+        ORDER BY v.banked_at DESC
+        LIMIT 1
+    ) prev ON true
+    WHERE prev.ticker IS NULL
+       OR prev.net_change_pct            IS DISTINCT FROM t.net_change_pct
+       OR prev.latest_filing             IS DISTINCT FROM t.latest_filing
+       OR prev.top_n_holders             IS DISTINCT FROM t.top_n_holders
+       OR prev.largest_holder_pct        IS DISTINCT FROM t.largest_holder_pct
+       OR prev.max_holder_conviction_pct IS DISTINCT FROM t.max_holder_conviction_pct
+    ON CONFLICT (ticker, banked_at) DO NOTHING;
+    GET DIAGNOSTICS v_inst = ROW_COUNT;
+
+    INSERT INTO fund_flow_vintage
+    SELECT CURRENT_DATE, t.*
+    FROM fund_flow_ticker t
+    LEFT JOIN LATERAL (
+        SELECT * FROM fund_flow_vintage v
+        WHERE v.ticker = t.ticker
+        ORDER BY v.banked_at DESC
+        LIMIT 1
+    ) prev ON true
+    WHERE prev.ticker IS NULL
+       OR prev.net_change_pct IS DISTINCT FROM t.net_change_pct
+       OR prev.latest_filing  IS DISTINCT FROM t.latest_filing
+       OR prev.top_n_funds    IS DISTINCT FROM t.top_n_funds
+    ON CONFLICT (ticker, banked_at) DO NOTHING;
+    GET DIAGNOSTICS v_fund = ROW_COUNT;
+
+    RETURN QUERY SELECT v_inst, v_fund;
+END;
+$$;
+
+
+ALTER FUNCTION public.bank_flow_vintages() OWNER TO jon;
 
 --
 -- Name: build_newsletter(date); Type: FUNCTION; Schema: public; Owner: jon
@@ -434,6 +486,22 @@ $$;
 
 
 ALTER FUNCTION public.newsletter_payload(p_issue_date date) OWNER TO jon;
+
+--
+-- Name: refresh_and_bank(); Type: FUNCTION; Schema: public; Owner: jon
+--
+
+CREATE FUNCTION public.refresh_and_bank() RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM refresh_metrics();
+    PERFORM bank_flow_vintages();
+END;
+$$;
+
+
+ALTER FUNCTION public.refresh_and_bank() OWNER TO jon;
 
 --
 -- Name: refresh_metrics(); Type: FUNCTION; Schema: public; Owner: jon
@@ -826,6 +894,33 @@ CREATE MATERIALIZED VIEW public.fund_flow_ticker AS
 ALTER MATERIALIZED VIEW public.fund_flow_ticker OWNER TO jon;
 
 --
+-- Name: fund_flow_vintage; Type: TABLE; Schema: public; Owner: jon
+--
+
+CREATE TABLE public.fund_flow_vintage (
+    banked_at date NOT NULL,
+    ticker text NOT NULL,
+    latest_filing date,
+    window_earliest_filing date,
+    filing_span_days integer,
+    observed_at date,
+    top_n_funds bigint,
+    funds_in_window bigint,
+    funds_stale bigint,
+    top_n_shares numeric,
+    top_n_pct_of_shares_out numeric,
+    net_change_shares numeric,
+    prior_shares_in_window numeric,
+    net_change_pct numeric,
+    n_initiated bigint,
+    n_added bigint,
+    n_trimmed bigint
+);
+
+
+ALTER TABLE public.fund_flow_vintage OWNER TO jon;
+
+--
 -- Name: fundamentals; Type: TABLE; Schema: public; Owner: postgres
 --
 
@@ -1117,6 +1212,36 @@ CREATE MATERIALIZED VIEW public.inst_flow_ticker AS
 
 
 ALTER MATERIALIZED VIEW public.inst_flow_ticker OWNER TO jon;
+
+--
+-- Name: inst_flow_vintage; Type: TABLE; Schema: public; Owner: jon
+--
+
+CREATE TABLE public.inst_flow_vintage (
+    banked_at date NOT NULL,
+    ticker text NOT NULL,
+    latest_filing date,
+    earliest_filing date,
+    observed_at date,
+    top_n_holders bigint,
+    top_n_at_cap boolean,
+    holders_at_latest bigint,
+    holders_lagging bigint,
+    top_n_shares numeric,
+    top_n_pct_of_shares_out numeric,
+    largest_holder_pct numeric,
+    max_holder_conviction_pct numeric,
+    net_change_shares numeric,
+    prior_shares_at_latest numeric,
+    net_change_pct numeric,
+    n_added bigint,
+    n_trimmed bigint,
+    n_initiated bigint,
+    n_unchanged bigint
+);
+
+
+ALTER TABLE public.inst_flow_vintage OWNER TO jon;
 
 --
 -- Name: intraday_prices; Type: TABLE; Schema: public; Owner: postgres
@@ -1869,6 +1994,14 @@ ALTER TABLE ONLY public.exchanges
 
 
 --
+-- Name: fund_flow_vintage fund_flow_vintage_pk; Type: CONSTRAINT; Schema: public; Owner: jon
+--
+
+ALTER TABLE ONLY public.fund_flow_vintage
+    ADD CONSTRAINT fund_flow_vintage_pk PRIMARY KEY (ticker, banked_at);
+
+
+--
 -- Name: fund_holders fund_holders_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -1922,6 +2055,14 @@ ALTER TABLE ONLY public.ingest_log
 
 ALTER TABLE ONLY public.insider_transactions
     ADD CONSTRAINT insider_transactions_pkey PRIMARY KEY (ticker, transaction_date, owner_name, transaction_code, shares);
+
+
+--
+-- Name: inst_flow_vintage inst_flow_vintage_pk; Type: CONSTRAINT; Schema: public; Owner: jon
+--
+
+ALTER TABLE ONLY public.inst_flow_vintage
+    ADD CONSTRAINT inst_flow_vintage_pk PRIMARY KEY (ticker, banked_at);
 
 
 --
@@ -2790,6 +2931,13 @@ GRANT SELECT ON TABLE public.fund_flow_ticker TO ai_agent;
 
 
 --
+-- Name: TABLE fund_flow_vintage; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.fund_flow_vintage TO ai_agent;
+
+
+--
 -- Name: TABLE fundamentals; Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -2857,6 +3005,13 @@ GRANT SELECT ON TABLE public.inst_flow TO ai_agent;
 --
 
 GRANT SELECT ON TABLE public.inst_flow_ticker TO ai_agent;
+
+
+--
+-- Name: TABLE inst_flow_vintage; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.inst_flow_vintage TO ai_agent;
 
 
 --
@@ -3050,5 +3205,5 @@ ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABL
 -- PostgreSQL database dump complete
 --
 
-\unrestrict DNXS9lbKgkZGdyNb9WLkhOs7ifRDzgqbXv1H4AhEf0Os6vH7gaKnQLrTCs7cofc
+\unrestrict KtC0bvjyrNf5ahEbmRdKuSQ7Uc3RKOxaxO0I0ZiV5Bnx8jnqdIxZETV9WsL4SHs
 

@@ -1,11 +1,19 @@
-click==8.4.2
-dash==4.1.0
-numpy==2.5.1
+# core
 pandas==3.0.3
-plotly==6.9.0
+numpy==2.5.1
 psycopg==3.3.4
-psycopg2==2.9.12
 psycopg_pool==3.3.1
-python-dotenv==1.2.2
-Requests==2.34.2
 SQLAlchemy==2.0.51
+Requests==2.34.2
+click==8.4.2
+python-dotenv==1.2.2
+
+# dashboard
+dash==4.1.0
+plotly==6.9.0
+
+# explorer
+ollama==0.1.9
+loguru==0.7.3
+rich==15.0.0
+pypandoc==1.17
