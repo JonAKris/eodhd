@@ -914,15 +914,20 @@ class Ingestor:
                 _to_num(row.get("currentShares")),   # shares_held (count)
                 _to_num(row.get("totalShares")),      # pct_shares  (% of company)
                 _to_num(row.get("totalAssets")),      # pct_assets  (% of holder assets)
+                _to_num(row.get("change")),           # change_shares (EODHD per-holder delta)
+                _to_num(row.get("change_p")),         # change_pct
             ))
         execute_many(
             """INSERT INTO institutional_holders (ticker,holder_name,report_date,
-                                                  shares_held,pct_shares,pct_assets)
-               VALUES (%s,%s,%s,%s,%s,%s)
+                                                  shares_held,pct_shares,pct_assets,
+                                                  change_shares,change_pct)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (ticker,holder_name,report_date) DO UPDATE SET
                  shares_held=EXCLUDED.shares_held,
                  pct_shares=EXCLUDED.pct_shares,
-                 pct_assets=EXCLUDED.pct_assets""",
+                 pct_assets=EXCLUDED.pct_assets,
+                 change_shares=EXCLUDED.change_shares,
+                 change_pct=EXCLUDED.change_pct""",
             iparams,
         )
 
@@ -935,13 +940,18 @@ class Ingestor:
                 ticker, row.get("name"), _to_date(row.get("date")),
                 _to_num(row.get("currentShares")),   # shares_held (count)
                 _to_num(row.get("totalShares")),      # pct_shares  (% of company)
+                _to_num(row.get("change")),           # change_shares (EODHD per-holder delta)
+                _to_num(row.get("change_p")),         # change_pct
             ))
         execute_many(
-            """INSERT INTO fund_holders (ticker,holder_name,report_date,shares_held,pct_shares)
-               VALUES (%s,%s,%s,%s,%s)
+            """INSERT INTO fund_holders (ticker,holder_name,report_date,shares_held,pct_shares,
+                                         change_shares,change_pct)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (ticker,holder_name,report_date) DO UPDATE SET
                  shares_held=EXCLUDED.shares_held,
-                 pct_shares=EXCLUDED.pct_shares""",
+                 pct_shares=EXCLUDED.pct_shares,
+                 change_shares=EXCLUDED.change_shares,
+                 change_pct=EXCLUDED.change_pct""",
             fparams,
         )
 
