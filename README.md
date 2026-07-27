@@ -1,144 +1,205 @@
-# EODHD → Postgres + Dash Stock Charting App
+# EODHD Stock Analysis Platform
 
-A Python application that ingests data from the [EODHD](https://eodhd.com) **All-in-One API package** into a Postgres database, plus a Dash web app for charting prices, browsing company fundamentals, and managing portfolios and trades.
+A local, end-to-end equity research platform built on the [EODHD](https://eodhd.com)
+**All-in-One API**, a Postgres data warehouse, and a home-lab GPU for local LLM
+inference. It ingests prices, fundamentals, holders, insider filings, news, and
+macro data into Postgres, then layers four subsystems on top:
 
-## What's included
+1. **Ingest & warehouse** — pulls EODHD data into ~40 Postgres tables.
+2. **Dashboard** (`app.py`) — a Dash web app for charting, fundamentals, and portfolio/trade CRUD.
+3. **The agent** (`agent/`) — a point-in-time signal framework: pluggable strategies
+   behind one `Signal`/`Strategy`/`Context` contract, ranked across the universe.
+4. **The explorer** (`explorer/`) — an autonomous, LLM-driven job that runs SQL
+   strategies, cross-references multi-signal names, and emails a grounded morning report.
 
-| File | Purpose |
+Plus a factor **backtest harness** (`backtest.py`) and an SSG **screener**
+(`ssg_screener.py`).
+
+> Design principle throughout: **the data layer computes; the LLM only narrates.**
+> Every number the models emit is pre-computed and verified — signals are graded
+> on whether they're *real* (information coefficient) before they're profitable,
+> and point-in-time correctness (no look-ahead) is enforced in code, not assumed.
+
+---
+
+## Repository layout
+
+| Path | Purpose |
 |---|---|
-| `sql/schema.sql` | Postgres DDL: creates the `eodhd` database and ~35 tables covering prices, fundamentals, corporate actions, news, calendars, macro data, options, plus portfolio/trade CRUD tables |
-| `config.py` | Loads settings from `.env` (no extra dependency) |
-| `db.py` | psycopg3 connection pool + small helpers (`fetch_all`, `execute`, etc.) |
-| `ingest.py` | `Ingestor` class wrapping the official `eodhd.APIClient`, plus a CLI |
-| `portfolio.py` | Pure-database CRUD layer for portfolios & trades |
-| `app.py` | Dash app: charting, fundamentals tabs, portfolio CRUD |
-| `requirements.txt` | Python dependencies |
-| `.env.example` | Template for your local `.env` |
+| `sql/schema.sql` | Postgres DDL — creates the `eodhd` database and ~40 tables (prices, fundamentals, holders, insider transactions, corporate actions, news, calendars, macro, options, portfolio/trades) |
+| `sql/01_metrics_views.sql` | Materialized views: `inst_flow` / `fund_flow` holder rollups, `price_perf` returns |
+| `sql/02_newsletter_findings.sql` | `build_newsletter()` / `newsletter_payload()` — the SQL→LLM contract for the newsletter |
+| `sql/flow_vintages.sql` | Vintage-banking layer: dated snapshots of the holder rollups (`bank_flow_vintages()`, `refresh_and_bank()`) |
+| `sql/migration_insider.sql` | Adds `report_date` / `owner_title` to `insider_transactions` |
+| `sql/backfill_fund_change.sql` | One-time repair of `fund_holders.change_shares` from stored JSONB (see *Historical migrations* below) |
+| `config.py` | Settings from `.env` — writer (`dsn`) and read-only (`ro_dsn`) identities |
+| `db.py` | psycopg3 connection pool + helpers (`fetch_all`, `fetch_one`, `execute`, `execute_many`) |
+| `ingest.py` | `Ingestor` wrapping the official `eodhd.APIClient`, with a CLI |
+| `ingest_delisted.py` | Backfills delisted symbols for survivorship-correct history |
+| `backtest.py` | Point-in-time factor backtester (momentum, value, quality, piotroski) with IC-first scoring |
+| `ssg_screener.py` | BetterInvesting/NAIC Stock Selection Guide screener with focus-forecasting |
+| `portfolio.py` | Pure-database CRUD for portfolios & trades |
+| `app.py` | Dash dashboard |
+| `agent/` | The point-in-time signal agent (see below) |
+| `explorer/` | The autonomous LLM explorer (see below) |
+| `systemd/` | Service + timer units for the explorer |
+
+---
+
+## The agent (`agent/`)
+
+Five strategies conform to a single contract and are ranked across the universe
+by one command.
+
+```
+agent/
+  core/
+    contract.py     Signal, Strategy (the interface)
+    context.py      Context, Floors (DB access + validity thresholds)
+    registry.py     the strategy roster
+    universe.py     the ticker set to rank over
+  strategies/
+    momentum.py             12-1 price momentum (point-in-time, backtestable)
+    value.py                trailing earnings yield (point-in-time, backtestable)
+    insider.py              net open-market insider $ (event signal, filing-date gated)
+    institutional_flow.py   net institutional share-count change (vintage-backed)
+    ssg.py                  wraps ssg_screener as a rich-study strategy
+  modes/
+    select.py       rank the universe by a strategy as of a date
+  cli.py            entry point
+  selftest.py       offline test suite (no DB required)
+```
+
+Every strategy returns a `Signal(value, as_of, flags, detail)`. `value is None`
+means *not rankable* (below a validity floor, or not knowable as of that date) —
+never zero. Signals are either **retrospectively backtestable** (momentum, value,
+insider — sourced from data with honest as-of dates) or **prospective-only**
+(institutional flow, SSG — snapshot-sourced), with the distinction enforced by
+the as-of gate rather than left to the caller.
+
+```bash
+# rank the universe by a strategy
+python -m agent.cli select --strategy momentum --limit 500 --top 15
+python -m agent.cli select --strategy ssg --sector Technology --out ssg_picks.csv
+python -m agent.cli select --strategy institutional_flow --ascending --top 20   # distribution
+
+# offline test suite (fake DB, no connection needed)
+python -m agent.selftest
+```
+
+### The vintage layer
+
+Holder rollups (`inst_flow_ticker`, `fund_flow_ticker`) are rebuilt from a
+*current* snapshot each refresh, so on their own they can only answer "what is
+true now." `sql/flow_vintages.sql` appends a dated copy on every refresh
+(`bank_flow_vintages()`), so the snapshot signals accumulate a point-in-time
+history and become backtestable **going forward from the first bank**. Wire it
+into your refresh job via `refresh_and_bank()` (run as the writer role).
+
+---
+
+## The explorer (`explorer/`)
+
+An autonomous overnight job: it runs a library of SQL strategies at randomized
+parameters, cross-references tickers that light up on multiple signals, has a
+local LLM interpret the results, and emails a grounded morning report. The LLM
+never sees the database and does no arithmetic — it narrates pre-computed facts.
+
+```
+explorer/
+  runner.py         orchestrates strategies → cross-reference → report
+  sql_strategies.py library of SQL strategies (value/quality, momentum, holder
+                    conviction, congressional trades, earnings, dividends, …)
+  llm.py            Ollama interface (schema-constrained JSON, JSON repair)
+  morning_report.py assembles + emails the HTML report
+```
+
+```bash
+python -m explorer.runner          # one exploration cycle → findings/
+```
+
+Runs read-only. Schedule it with the `systemd/` units (which pin the process to
+the read-only DB role); adjust the timer to land before your morning slot.
+
+---
 
 ## Prerequisites
 
 - Python 3.10+
-- Postgres 14+ (with the `pgcrypto`, `btree_gin`, `pg_trgm` extensions available — these ship with the standard `postgresql-contrib` package on most distributions)
-- An EODHD API key (the string `demo` works for `AAPL.US` and a handful of other symbols if you just want to try things out)
+- Postgres 16 (with `pgcrypto`, `btree_gin`, `pg_trgm` — from `postgresql-contrib`)
+- An EODHD API key (`demo` works for `AAPL.US` and a few others to try things)
+- For the explorer: [Ollama](https://ollama.com) with a local model (this repo
+  defaults to `qwen3.6:35b`; a 24GB GPU is comfortable)
 
 ## Setup
 
 ```bash
-# 1. Clone / copy the project, then:
-cd eodhd_app
-python -m venv .venv
-source .venv/bin/activate
+cd eodhd
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Configure
 cp .env.example .env
-# edit .env: set EODHD_API_KEY and your Postgres credentials
+# edit .env — see "Configuration & roles" below
 
-# 3. Create the database and schema
-#    The script creates the `eodhd` database itself, so connect to `postgres` first.
+# create the database and schema (schema.sql creates the eodhd DB itself,
+# so connect to `postgres` first)
 psql -U postgres -h localhost -d postgres -f sql/schema.sql
+
+# then the analytics layer
+psql "$DSN" -f sql/01_metrics_views.sql
+psql "$DSN" -f sql/02_newsletter_findings.sql
+psql "$DSN" -f sql/migration_insider.sql
+psql "$DSN" -f sql/flow_vintages.sql
 ```
 
-The schema script is idempotent for table creation (uses `CREATE TABLE IF NOT EXISTS`) but the initial `CREATE DATABASE eodhd` will error if the DB already exists — that's harmless, the rest of the script will still run after you `\c eodhd`.
+## Configuration & roles
 
-### Migrations (existing databases)
+Config is environment variables only (`config.py` reads `.env` — no dependency).
+The platform uses **two database identities**, and keeping them separate is a
+deliberate safety boundary:
 
-If you already have a populated database from an earlier version, apply the migrations in `sql/migrations/` to bring the schema up to date without a full re-ingest. They are idempotent (safe to re-run):
-
-```bash
-psql -U postgres -h localhost -d postgres -f sql/migrations/2026-05-28_fix_holders_columns.sql
-```
-
-`2026-05-28_fix_holders_columns.sql` fixes a holders-data bug: EODHD's `currentShares` (a raw share *count*) was being stored in `pct_held`, while `totalShares` (the actual *percentage* of the company held) went into `total_shares`. The migration renames the columns to honest names (`shares_held`, `pct_shares`, `pct_assets`) and swaps the data so existing rows become correct. Fresh installs from `schema.sql` already have the corrected columns.
+- **Writer** (`PG_USER` / `PG_PASSWORD`) — ingest, view refresh, vintage banking.
+- **Read-only** (`PG_RO_USER` / `PG_RO_PASSWORD`) — the agent, the explorer, the
+  dashboard. Grant it `SELECT` only. `config.ro_dsn` falls back to the writer
+  identity if the read-only vars are unset, so a single-role setup still works.
 
 ## Ingesting data
 
-The `ingest.py` CLI exposes every endpoint as a subcommand. Typical first-time workflow:
-
 ```bash
-# Reference data (run once, refresh occasionally)
 python ingest.py exchanges
-python ingest.py symbols US        # populate all US tickers
-
-# All data for one ticker (EOD prices, fundamentals, dividends, splits, live quote, news, sentiment)
-python ingest.py all AAPL.US
-
-# Look up a company by name or partial symbol (Search API)
-python ingest.py search Apple
-python ingest.py search "berkshire" --limit 5
-
-# Resolve a free-text query to a ticker, then ingest everything for it
-python ingest.py all "Apple" --resolve
-
-# Or pick & choose
-python ingest.py eod AAPL.US --from 2020-01-01
-python ingest.py fundamentals MSFT.US
-python ingest.py dividends KO.US
-python ingest.py intraday TSLA.US --interval 5m
-python ingest.py news NVDA.US --limit 50
-
-# Calendars (no ticker needed)
-python ingest.py calendar-earnings --from 2026-05-19 --to 2026-05-26
-python ingest.py calendar-ipos
-python ingest.py calendar-splits
-
-# Macro
-python ingest.py economic-events --country US
-python ingest.py macro --country US --indicator real_interest_rate
-
-# Options chain
-python ingest.py options AAPL.US
-
-# Refresh EOD prices for every active symbol since a date
-python ingest.py eod-refresh --since 2026-05-01
+python ingest.py symbols US
+python ingest.py all AAPL.US            # everything for one ticker
+python ingest.py eod-refresh            # update recent prices
+python ingest.py insider GME.US         # Form 4 insider transactions
 ```
 
-Tickers are stored in EODHD's `SYMBOL.EXCHANGE` form (e.g. `AAPL.US`, `BMW.XETRA`). The ingestor automatically creates a skeleton row in `symbols` and `exchanges` for any ticker you load, so FK constraints are always satisfied.
-
-Every ingest run is logged to the `ingest_log` table with row counts and any error.
-
-## Running the Dash app
+Then refresh (and bank) the analytics views on a schedule:
 
 ```bash
-python app.py
+psql "$WRITER_DSN" -c "SELECT refresh_and_bank();"   # run as the writer role
 ```
 
-Open <http://localhost:8050>. Pages:
-
-- **`/`** — landing page with a "Quick ingest" form. Type a full ticker (`AAPL.US`) and hit **Ingest everything**, or type a company name / partial symbol, hit **Look up** to see candidate matches from the Search API, pick one, then ingest. Runs `Ingestor.ingest_all_for_ticker` from the browser.
-- **`/chart`** — type a ticker (autocomplete from the `symbols` table), pick a date range, chart type (Candlestick / OHLC / Line / Area), and overlays (SMA 20/50/200, Bollinger Bands, Volume). A **Stock Selection Guide (SSG)** checkbox renders the NAIC guide below the chart (semi-log Sales/EPS/Price with growth trendlines, P/E history, and projected 5-year buy/maybe/sell price zones). Below the chart: a fundamentals header (price, market cap, P/E, dividend yield, 52-week range) plus 12 tabs — Overview, Income Statement, Balance Sheet, Cash Flow, Valuation, Earnings, Dividends & Splits, Holders, Insider Trades, Analyst Ratings, ESG, News.
-- **`/portfolios`** — list view with full CRUD: create / rename / delete portfolios. The summary view (`portfolio_summary`) shows trade count and net cash flow per portfolio.
-- **`/portfolios/<id>`** — single portfolio view: stat cards (initial cash, current value, P&L), a trades table with full CRUD (add buy/sell, edit, delete), a positions table joining current holdings against the latest EOD price for unrealised P&L, and an equity-curve chart marking-to-market every day since the portfolio's first trade.
-
-For production-style deployment you can run via gunicorn:
+## Backtesting
 
 ```bash
-gunicorn -b 0.0.0.0:8050 app:server
+python backtest.py --validate                 # schema sanity check
+python backtest.py --signal momentum          # IC + decile spread over history
 ```
 
-## Data model highlights
+---
 
-The schema mirrors the EODHD All-in-One package endpoints:
+## Historical migrations
 
-- **Reference** — `exchanges`, `exchange_details`, `symbols`, `symbol_change_history`
-- **Prices** — `eod_prices`, `intraday_prices`, `realtime_quotes`, `tick_data`, `technical_indicators`
-- **Corporate actions** — `dividends`, `splits`, `shares_outstanding`, `historical_market_cap`
-- **Fundamentals** — `fundamentals` (header with frequently-queried scalar columns *and* JSONB for nested sections like analyst ratings, holders, ESG scores, ETF data, components), plus normalised tables for `income_statements`, `balance_sheets`, `cash_flow_statements`, `earnings_history`, `earnings_trend`, `analyst_ratings_history`, `institutional_holders`, `fund_holders`, `insider_transactions`
-- **News & sentiment** — `news`, `sentiment_daily`
-- **Calendars** — `earnings_calendar`, `ipo_calendar`, `splits_calendar`
-- **Macro** — `economic_events`, `macro_indicators`
-- **Options** — `options_chains` (one row per contract, Greeks included)
-- **Bonds** — `bond_fundamentals`
-- **Portfolio CRUD** — `users`, `portfolios`, `trades`, plus views `portfolio_positions` and `portfolio_summary`
-- **Bookkeeping** — `ingest_log`
+Two SQL files are **one-time repairs**, not part of setup — they fixed ingest
+bugs by recovering data already stored as JSONB, with no API re-pull. They're
+idempotent but need only run once:
 
-The decision rule for "scalar column vs JSONB" was: anything you'd routinely filter or sort on (sector, market cap, P/E, dividend yield, etc.) gets its own column; anything you'd only ever display whole (full analyst rating history, all institutional holders, ESG breakdowns) is kept as JSONB so we don't paper over EODHD's schema evolution.
+- `sql/backfill_fund_change.sql` — repaired `fund_holders.change_shares`, which
+  the ingest originally never mapped.
+- (insider share/value repair — applied via a prior backfill.)
 
-A demo user (UUID `00000000-0000-0000-0000-000000000001`) is seeded by the schema, and the Dash app uses it by default — wire in real auth later if you need multi-tenancy.
+The ingest now maps these fields correctly at write time, so new pulls don't need them.
 
-## Notes & limitations
+## License
 
-- The official `eodhd` PyPI library is used for every API call. If EODHD adds new endpoints, extend `ingest.py` and add a matching table to `schema.sql`.
-- Bulk EOD download (`get_bulk_eod_splits_dividends_data`) is not wired into the CLI; if you have an "All World Extended" subscription, you can add a subcommand that iterates exchanges.
-- The portfolio equity-curve walks every distinct date in `eod_prices` for the held tickers — fine for hundreds of trades, but if you build huge portfolios you may want to materialise it.
-- The "Ingest" button on the landing page runs synchronously inside the Dash callback, so a fresh ticker can take 10–30 seconds. For production, move ingest to a queue (RQ, Celery, or a cron job hitting `ingest.py`).
+See `LICENSE`.
