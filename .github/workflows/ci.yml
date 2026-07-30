@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # psycopg (v3) is pure-Python and loads libpq at runtime. Installing it
+      # here keeps the door open for any future import-level DB check; the
+      # offline self-test itself does not open a connection.
+      - name: Install libpq (psycopg v3 runtime dependency)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpq5
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Byte-compile every module so a syntax error anywhere fails CI, even in
+      # files the self-test does not import (app.py, backtest.py, ingest*.py).
+      - name: Byte-compile all modules
+        run: python -m compileall -q .
+
+      # Offline strategy/contract self-test. Exits non-zero on failure, so this
+      # gates merges on the agent logic staying correct.
+      - name: Run offline self-test
+        run: python -m agent.selftest

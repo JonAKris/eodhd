@@ -33,14 +33,12 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
+import config  # noqa: F401 -- importing config loads .env into os.environ
 from sqlalchemy import create_engine, text
 
 # ----------------------------------------------------------------------------
 # Configuration  (flagged judgment calls live here, not buried in the code)
 # ----------------------------------------------------------------------------
-
-load_dotenv()
 
 # The backtester only ever reads, so it connects through the read-only role
 # (PG_RO_*, falling back to the writer identity when unset), and uses the

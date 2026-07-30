@@ -10,7 +10,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-# Tiny .env loader so we don't force a python-dotenv dependency.
+# Tiny .env loader -- the single mechanism the whole platform uses to read
+# .env, so no python-dotenv dependency is needed anywhere.
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 if ENV_PATH.exists():
     for raw in ENV_PATH.read_text().splitlines():

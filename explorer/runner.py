@@ -25,7 +25,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 import db
 from config import settings
 from .llm import LLMInterface
-from .sql_strategies import STRATEGIES
+from .sql_strategies import STRATEGIES, validate_params
 
 console = Console()
 
@@ -169,7 +169,10 @@ class StockExplorer:
                 all_results = []
                 for strategy_name, strategy in STRATEGIES.items():
                     for i in range(3):
-                        params = {k: random.choice(v) for k, v in strategy.get('params', {}).items()}
+                        allowed = strategy.get('params', {})
+                        params = {k: random.choice(v) for k, v in allowed.items()}
+                        # Gate values before they are formatted into SQL.
+                        params = validate_params(strategy_name, allowed, params)
 
                         try:
                             query = strategy['query'].format(**params)

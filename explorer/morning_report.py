@@ -8,8 +8,8 @@ Mirrors the old morning-review bash script:
   * converts the combined Markdown to HTML with pypandoc
   * emails a mobile-friendly HTML email (with a plain-text fallback)
 
-Configuration is read from environment variables. A .env file in the working
-directory is loaded automatically if python-dotenv is installed.
+Configuration is read from environment variables. A .env file in the project
+directory is loaded automatically via config.py.
 
   FINDINGS_DIR    directory holding report_*.md / results_*.json
                   (default: ~/stock-explorer-agent/findings)
@@ -35,7 +35,7 @@ Usage:
   python morning_report.py --out report.html     # also save the HTML
 
 Dependencies:
-  pip install pypandoc-binary python-dotenv
+  pip install pypandoc-binary
   pip install dkimpy            # only if you enable DKIM signing
 """
 
@@ -53,9 +53,7 @@ from email.utils import formatdate, make_msgid
 from pathlib import Path
 
 try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
+    import config  # noqa: F401 -- importing config loads .env into os.environ
 except ImportError:
     pass
 

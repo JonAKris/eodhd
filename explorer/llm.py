@@ -5,10 +5,8 @@ import re
 import pandas as pd
 import ollama
 from loguru import logger
-from dotenv import load_dotenv
+import config  # noqa: F401 -- importing config loads .env into os.environ
 from json_repair import repair_json
-
-load_dotenv('config/.env')
 
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://127.0.0.1:11434')
 os.environ['OLLAMA_HOST'] = OLLAMA_HOST

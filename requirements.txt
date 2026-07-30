@@ -6,7 +6,6 @@ psycopg_pool==3.3.1
 SQLAlchemy==2.0.51
 Requests==2.34.2
 click==8.4.2
-python-dotenv==1.2.2
 
 # dashboard
 dash==4.1.0

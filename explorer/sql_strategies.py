@@ -1,5 +1,6 @@
 """Schema-aware investment strategies - tuned for actual data formats"""
 import random
+import re
 from typing import Dict, List
 
 STRATEGIES = {
@@ -378,3 +379,40 @@ STRATEGIES = {
         },
     }
 }
+
+
+# Strict pattern for the few string-valued params (e.g. the benchmark symbol).
+# Such values must ALSO appear in their strategy's own allowlist below.
+_SAFE_STR = re.compile(r"^[A-Za-z0-9.\-]{1,20}$")
+
+
+def validate_params(strategy_name: str, allowed: dict, chosen: dict) -> dict:
+    """Gate every value before it is str.format()'d into a query string.
+
+    The explorer substitutes {name} placeholders into SQL rather than binding
+    parameters (interval literals and identifiers don't all bind cleanly), so
+    this is the single seam where a value becomes SQL. Values are only ever
+    drawn from each strategy's hardcoded ``params`` lists, so today this guard
+    only ever passes -- but it makes injection structurally impossible if params
+    ever come from anywhere else. Ints and floats pass as numeric literals;
+    strings must both match a strict pattern AND appear in the declared
+    allowlist; anything else (including bool, an int subclass) is rejected.
+    """
+    safe: dict = {}
+    for key, value in chosen.items():
+        if isinstance(value, bool):
+            raise ValueError(f"{strategy_name}.{key}: bool is not a valid query value")
+        if isinstance(value, (int, float)):
+            safe[key] = value
+        elif isinstance(value, str):
+            if value not in allowed.get(key, ()):
+                raise ValueError(
+                    f"{strategy_name}.{key}: {value!r} is not in the declared allowlist")
+            if not _SAFE_STR.match(value):
+                raise ValueError(
+                    f"{strategy_name}.{key}: {value!r} fails the safe-string check")
+            safe[key] = value
+        else:
+            raise ValueError(
+                f"{strategy_name}.{key}: unsupported param type {type(value).__name__}")
+    return safe
