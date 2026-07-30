@@ -42,8 +42,14 @@ from sqlalchemy import create_engine, text
 
 load_dotenv()
 
+# The backtester only ever reads, so it connects through the read-only role
+# (PG_RO_*, falling back to the writer identity when unset), and uses the
+# psycopg (v3) driver so psycopg2 is no longer required anywhere. An explicit
+# DATABASE_URL still overrides both.
 DATABASE_URL = os.getenv("DATABASE_URL") or (
-    f"postgresql+psycopg2://{os.getenv('PG_USER', 'jon')}:{os.getenv('PG_PASSWORD', '')}"
+    f"postgresql+psycopg://"
+    f"{os.getenv('PG_RO_USER', os.getenv('PG_USER', 'postgres'))}:"
+    f"{os.getenv('PG_RO_PASSWORD', os.getenv('PG_PASSWORD', ''))}"
     f"@{os.getenv('PG_HOST', 'localhost')}:{os.getenv('PG_PORT', '5432')}"
     f"/{os.getenv('PG_DB', 'eodhd')}"
 )

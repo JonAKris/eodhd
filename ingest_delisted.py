@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-ingest.py — symbol-list ingestion for the `eodhd` database.
+ingest_delisted.py — symbol-list ingestion for the `eodhd` database.
 
 `symbols` subcommand pulls EODHD's exchange-symbol-list and upserts into the
 `symbols` table. With --delisted it pulls the delisted roster instead of the
 active one and marks those rows is_active=false (Phase 1 of the backfill plan).
 
-  python ingest.py symbols --exchange US --dry-run        # active, preview only
-  python ingest.py symbols --exchange US --delisted --dry-run
-  python ingest.py symbols --exchange US --delisted        # writes
+  python ingest_delisted.py symbols --exchange US --dry-run        # active, preview only
+  python ingest_delisted.py symbols --exchange US --delisted --dry-run
+  python ingest_delisted.py symbols --exchange US --delisted        # writes
 
 -------------------------------------------------------------------------------
 VERIFY THESE 3 THINGS against your existing rows before the first real write
@@ -21,8 +21,10 @@ VERIFY THESE 3 THINGS against your existing rows before the first real write
   2. ticker construction. Built as f"{Code}.{exchange}". Confirm that matches your
      existing ticker format exactly (incl. EODHD's "_old" suffix on reused codes,
      which arrives inside Code and is preserved as-is).
-  3. config source. Reads settings.toml first, then env. Confirm the keys below
-     match your settings.toml structure.
+  3. config source. The API token is read from settings.toml first, then the
+     EODHD_API_KEY env var. The database target comes from .env via config.py
+     (PG_* writer role), through the shared db.py pool -- the same config the
+     rest of the platform uses.
 -------------------------------------------------------------------------------
 """
 
@@ -41,8 +43,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-import psycopg2
-from psycopg2.extras import execute_values
+from config import settings
+from db import execute_many
 
 API_BASE = "https://eodhd.com/api/exchange-symbol-list"
 
@@ -61,7 +63,14 @@ DELIST_DATE_KEYS = ("DelistedDate", "Delisted", "DelistingDate", "delisted_on")
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
-    """settings.toml first (your convention), then environment fallback."""
+    """Resolve the EODHD API token: settings.toml ([eodhd].api_token) first,
+    then the EODHD_API_KEY environment variable.
+
+    The database target is no longer built here -- writes go through the shared
+    db.py pool, which reads PG_* (writer role) from .env via config.py, the same
+    as the rest of the platform. This removes the second, divergent DB-config
+    path this script used to carry.
+    """
     cfg: dict = {}
     toml_path = Path("settings.toml")
     if toml_path.exists() and tomllib is not None:
@@ -71,21 +80,10 @@ def load_config() -> dict:
     api_token = (cfg.get("eodhd", {}).get("api_token")
                  or os.getenv("EODHD_API_KEY"))
 
-    db = cfg.get("database", {})
-    dsn = (db.get("dsn")
-           or os.getenv("DATABASE_URL")
-           or "dbname={d} user={u} password={p} host={h} port={pt}".format(
-               d=db.get("dbname") or os.getenv("PGDATABASE", "eodhd"),
-               u=db.get("user") or os.getenv("PGUSER", "jon"),
-               p=db.get("password") or os.getenv("PGPASSWORD", ""),
-               h=db.get("host") or os.getenv("PGHOST", "localhost"),
-               pt=db.get("port") or os.getenv("PGPORT", "5432"),
-           ))
-
     if not api_token:
         sys.exit("No EODHD API token. Set [eodhd].api_token in settings.toml "
-                 "or EODHD_API_TOKEN in the environment.")
-    return {"api_token": api_token, "dsn": dsn}
+                 "or EODHD_API_KEY in the environment.")
+    return {"api_token": api_token}
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +147,7 @@ COLUMNS = ["ticker", "code", "exchange_code", "name", "country",
 
 UPSERT_SQL = f"""
 INSERT INTO symbols ({", ".join(COLUMNS)})
-VALUES %s
+VALUES ({", ".join(["%s"] * len(COLUMNS))})
 ON CONFLICT (ticker) DO UPDATE SET
     code          = EXCLUDED.code,
     exchange_code = EXCLUDED.exchange_code,
@@ -164,12 +162,15 @@ ON CONFLICT (ticker) DO UPDATE SET
 """
 
 
-def upsert_symbols(dsn: str, rows: list[dict]) -> int:
+def upsert_symbols(rows: list[dict]) -> int:
+    """Upsert mapped rows into `symbols` via the shared writer pool.
+
+    psycopg3's executemany batches the per-row upsert efficiently; we return
+    the number of rows sent (ON CONFLICT makes driver rowcount unreliable as a
+    changed-row count).
+    """
     values = [tuple(r[c] for c in COLUMNS) for r in rows]
-    with psycopg2.connect(dsn) as conn:
-        with conn.cursor() as cur:
-            execute_values(cur, UPSERT_SQL, values, page_size=1000)
-        conn.commit()
+    execute_many(UPSERT_SQL, values)
     return len(values)
 
 
@@ -223,7 +224,7 @@ def symbols(exchange, delisted, dry_run, limit):
                    "without --dry-run.")
         return
 
-    n = upsert_symbols(cfg["dsn"], rows)
+    n = upsert_symbols(rows)
     click.echo(f"\nUpserted {n} rows into symbols.")
 
 
