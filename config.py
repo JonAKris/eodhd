@@ -39,7 +39,7 @@ class Settings:
 
     dash_host: str = os.getenv("DASH_HOST", "127.0.0.1")
     dash_port: int = int(os.getenv("DASH_PORT", "8050"))
-    dash_debug: bool = os.getenv("DASH_DEBUG", "true").lower() == "true"
+    dash_debug: bool = os.getenv("DASH_DEBUG", "false").lower() == "true"
 
     @property
     def dsn(self) -> str:

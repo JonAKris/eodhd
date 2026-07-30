@@ -1657,6 +1657,27 @@ def _equity_curve_fig(portfolio_id: str) -> go.Figure:
 # ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _guard_debug_bind(host: str, debug: bool) -> None:
+    """Refuse to expose Werkzeug's interactive debugger off-box.
+
+    Dash/Flask debug mode enables the Werkzeug debugger, whose in-browser
+    console executes arbitrary Python for anyone who can reach the port.
+    Combined with a non-loopback bind that is remote code execution over the
+    network, so we fail closed: debug is only permitted on a loopback host.
+    """
+    if debug and host not in _LOOPBACK_HOSTS:
+        raise SystemExit(
+            f"Refusing to start: DASH_DEBUG is on with DASH_HOST={host!r}. "
+            "The debugger allows remote code execution and must never be bound "
+            "off-box. Set DASH_HOST=127.0.0.1 to debug locally, or "
+            "DASH_DEBUG=false to bind a non-loopback interface."
+        )
+
+
 if __name__ == "__main__":
+    _guard_debug_bind(settings.dash_host, settings.dash_debug)
     app.run(host=settings.dash_host, port=settings.dash_port,
             debug=settings.dash_debug)
