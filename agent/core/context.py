@@ -113,13 +113,19 @@ class Context:
 
 
 def _dsn_from_env() -> str:
+    """Resolve a DSN for the agent. The agent only ever reads, so it connects
+    through the read-only role: PG_RO_USER / PG_RO_PASSWORD, falling back to the
+    writer identity when those are unset (mirrors config.ro_dsn's single-role
+    fallback). An explicit DATABASE_URL still wins over both."""
     url = os.getenv("DATABASE_URL")
     if url:
         return url
+    ro_user = os.getenv("PG_RO_USER", os.getenv("PG_USER", "postgres"))
+    ro_password = os.getenv("PG_RO_PASSWORD", os.getenv("PG_PASSWORD", ""))
     return (
         f"host={os.getenv('PG_HOST', 'localhost')} "
         f"port={os.getenv('PG_PORT', '5432')} "
         f"dbname={os.getenv('PG_DB', 'eodhd')} "
-        f"user={os.getenv('PG_USER', 'postgres')} "
-        f"password={os.getenv('PG_PASSWORD', '')}"
+        f"user={ro_user} "
+        f"password={ro_password}"
     )

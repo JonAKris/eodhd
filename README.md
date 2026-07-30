@@ -156,12 +156,22 @@ psql "$DSN" -f sql/flow_vintages.sql
 
 Config is environment variables only (`config.py` reads `.env` — no dependency).
 The platform uses **two database identities**, and keeping them separate is a
-deliberate safety boundary:
+deliberate safety boundary — one that `db.py` now enforces in code by opening a
+separate pool per role, rather than leaving it to convention:
 
-- **Writer** (`PG_USER` / `PG_PASSWORD`) — ingest, view refresh, vintage banking.
-- **Read-only** (`PG_RO_USER` / `PG_RO_PASSWORD`) — the agent, the explorer, the
-  dashboard. Grant it `SELECT` only. `config.ro_dsn` falls back to the writer
-  identity if the read-only vars are unset, so a single-role setup still works.
+- **Writer** (`PG_USER` / `PG_PASSWORD`) — ingest, view refresh, vintage banking,
+  and portfolio/trade CRUD. The default `db.py` helpers (`fetch_all`, `execute`,
+  …) use this pool.
+- **Read-only** (`PG_RO_USER` / `PG_RO_PASSWORD`) — the agent, the explorer, and
+  the dashboard's market-data reads. These go through `db.fetch_all_ro` /
+  `fetch_one_ro` (and, for the agent, `Context.from_dsn()`), which connect via
+  `config.ro_dsn`. Grant this role `SELECT` only. It falls back to the writer
+  identity when `PG_RO_*` is unset, so a single-role setup still works.
+
+The dashboard therefore uses **both** identities: it browses market data through
+the read-only role, and performs portfolio/trade writes through the writer role
+(via `portfolio.py`). The read-only role never needs write grants on any table —
+including `portfolios` and `trades`, which the writer owns.
 
 ## Ingesting data
 

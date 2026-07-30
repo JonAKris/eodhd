@@ -51,7 +51,7 @@ log = logging.getLogger("ssg_screener")
 # otherwise fall back to a self-contained psycopg connection from env vars.
 # ---------------------------------------------------------------------------
 try:
-    from db import fetch_all as _fetch_all  # type: ignore
+    from db import fetch_all_ro as _fetch_all  # type: ignore -- screener is read-only
 
     def fetch_all(sql: str, params: tuple | dict | None = None) -> list[dict]:
         return _fetch_all(sql, params)
@@ -66,12 +66,16 @@ except Exception:  # noqa: BLE001 -- standalone mode
         url = os.getenv("DATABASE_URL")
         if url:
             return url
+        # Prefer the read-only role; fall back to the writer identity when
+        # PG_RO_* is unset, mirroring config.ro_dsn.
+        ro_user = os.getenv("PG_RO_USER", os.getenv("PG_USER", "postgres"))
+        ro_password = os.getenv("PG_RO_PASSWORD", os.getenv("PG_PASSWORD", "postgres"))
         return (
             f"host={os.getenv('PG_HOST', 'localhost')} "
             f"port={os.getenv('PG_PORT', '5432')} "
             f"dbname={os.getenv('PG_DB', 'eodhd')} "
-            f"user={os.getenv('PG_USER', 'postgres')} "
-            f"password={os.getenv('PG_PASSWORD', 'postgres')}"
+            f"user={ro_user} "
+            f"password={ro_password}"
         )
 
     _CONN = None

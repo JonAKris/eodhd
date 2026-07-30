@@ -34,7 +34,9 @@ from plotly.subplots import make_subplots
 
 import portfolio as pf
 from config import settings
-from db import fetch_all, fetch_one
+# The dashboard reads market data through the read-only role; portfolio and
+# trade writes go through portfolio.py, which holds the writer identity.
+from db import fetch_all_ro as fetch_all, fetch_one_ro as fetch_one
 from ingest import Ingestor
 
 logging.basicConfig(level=logging.INFO,

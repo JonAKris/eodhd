@@ -75,7 +75,7 @@ def build_facts(top_tickers):
 
     tickers = [t for t, _ in top_tickers]
     try:
-        rows = db.fetch_all(
+        rows = db.fetch_all_ro(
             """
             SELECT f.ticker, f.name, f.sector, f.industry, f.market_cap,
                    f.pe_ratio, f.return_on_equity, f.profit_margin,
@@ -122,7 +122,7 @@ def _universe_banner():
     n_tables = None
     universe_size = None
     try:
-        rows = db.fetch_all(
+        rows = db.fetch_all_ro(
             "SELECT count(*) AS n FROM information_schema.tables "
             "WHERE table_schema = 'public'"
         )
@@ -130,7 +130,7 @@ def _universe_banner():
     except Exception as exc:
         logger.warning(f"table count failed ({exc})")
     try:
-        row = db.fetch_one("SELECT count(*) AS n FROM fundamentals")
+        row = db.fetch_one_ro("SELECT count(*) AS n FROM fundamentals")
         universe_size = row["n"] if row else None
     except Exception as exc:
         logger.warning(f"universe size failed ({exc})")
@@ -173,7 +173,7 @@ class StockExplorer:
 
                         try:
                             query = strategy['query'].format(**params)
-                            rows = db.fetch_all(query)
+                            rows = db.fetch_all_ro(query)
 
                             if rows:
                                 df = pd.DataFrame(rows)   # rows are dicts -> columns inferred
