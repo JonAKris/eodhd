@@ -134,6 +134,7 @@ the read-only DB role); adjust the timer to land before your morning slot.
 ## Setup
 
 ```bash
+git clone https://github.com/JonAKris/eodhd.git
 cd eodhd
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
@@ -144,12 +145,6 @@ cp .env.example .env
 # create the database and schema (schema.sql creates the eodhd DB itself,
 # so connect to `postgres` first)
 psql -U postgres -h localhost -d postgres -f sql/schema.sql
-
-# then the analytics layer
-psql "$DSN" -f sql/01_metrics_views.sql
-psql "$DSN" -f sql/02_newsletter_findings.sql
-psql "$DSN" -f sql/migration_insider.sql
-psql "$DSN" -f sql/flow_vintages.sql
 ```
 
 ## Configuration & roles
