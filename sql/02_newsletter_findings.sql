@@ -44,6 +44,28 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 
+-- ---------------------------------------------------------------------
+-- Benchmark set for the market-overview section (DOW, S&P, Nasdaq, ...).
+-- Config-driven so the symbols can change without touching the function.
+-- Defaults to liquid ETF proxies, which are present in eod_prices. Swap in
+-- true index tickers (e.g. GSPC.INDX, DJI.INDX) here if/when they are ingested.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS newsletter_benchmarks (
+    symbol       text PRIMARY KEY,
+    display_name text NOT NULL,
+    sort_order   int  NOT NULL DEFAULT 100
+);
+
+INSERT INTO newsletter_benchmarks (symbol, display_name, sort_order) VALUES
+  ('SPY.US', 'S&P 500 (SPY)',       10),
+  ('DIA.US', 'Dow Jones (DIA)',     20),
+  ('QQQ.US', 'Nasdaq 100 (QQQ)',    30),
+  ('IWM.US', 'Russell 2000 (IWM)',  40)
+ON CONFLICT (symbol) DO UPDATE
+  SET display_name = EXCLUDED.display_name,
+      sort_order   = EXCLUDED.sort_order;
+
+
 DROP TABLE IF EXISTS newsletter_findings CASCADE;
 
 CREATE TABLE newsletter_findings (
@@ -391,6 +413,142 @@ BEGIN
     LEFT JOIN fundamentals f ON f.ticker = d.ticker
     LEFT JOIN price_perf   p ON p.ticker = d.ticker
     ORDER BY abs(d.drift) DESC LIMIT cfg('top_n')::int;
+
+    -- ================= market_holidays =================
+    -- Opening-paragraph context: is the US market closed today, and when is
+    -- the next closure? Parsed defensively from exchange_details.holidays,
+    -- whose sub-object key spellings vary across EODHD payloads.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'market_holidays',
+        row_number() OVER (ORDER BY h.hdate),
+        NULL,
+        CASE WHEN h.hdate = p_issue_date
+             THEN format('US markets are closed today for %s.', h.name)
+             ELSE format('Next US market holiday: %s on %s (%s days away).',
+                         h.name, h.hdate, (h.hdate - p_issue_date)) END,
+        jsonb_build_object(
+            'exchange', 'US', 'name', h.name, 'type', h.htype, 'date', h.hdate,
+            'is_today', (h.hdate = p_issue_date),
+            'days_away', (h.hdate - p_issue_date))
+    FROM (
+        SELECT
+            COALESCE(v.value->>'Holiday', v.value->>'Name',
+                     v.value->>'holiday', v.key)                 AS name,
+            COALESCE(v.value->>'Type', v.value->>'type')         AS htype,
+            NULLIF(COALESCE(v.value->>'Date', v.value->>'date'), '')::date AS hdate
+        FROM exchange_details ed
+        CROSS JOIN LATERAL jsonb_each(ed.holidays) AS v(key, value)
+        WHERE ed.exchange_code = 'US'
+    ) h
+    -- today's closure, plus the single nearest upcoming one
+    WHERE h.hdate = p_issue_date
+       OR h.hdate = (SELECT min(x.hdate) FROM (
+               SELECT NULLIF(COALESCE(v.value->>'Date', v.value->>'date'), '')::date AS hdate
+               FROM exchange_details ed
+               CROSS JOIN LATERAL jsonb_each(ed.holidays) AS v(key, value)
+               WHERE ed.exchange_code = 'US'
+           ) x WHERE x.hdate > p_issue_date)
+    ORDER BY h.hdate;
+
+    -- ================= earnings_reports =================
+    -- Companies reporting on the issue date. Actuals vs estimate when the
+    -- print has landed, otherwise the scheduled session. Ranked by size so
+    -- the most consequential names lead the paragraph.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'earnings_reports',
+        row_number() OVER (ORDER BY COALESCE(f.market_cap, 0) DESC),
+        ec.ticker,
+        CASE WHEN ec.eps_actual IS NOT NULL THEN
+            format('%s (%s) reported EPS of %s vs %s estimate (%s%% surprise), %s.',
+                   COALESCE(f.name, ec.ticker), ec.ticker,
+                   to_char(ec.eps_actual,   'FM999990.00'),
+                   to_char(ec.eps_estimate, 'FM999990.00'),
+                   to_char(ec.surprise_pct, 'FM999990.0'),
+                   lower(COALESCE(ec.before_after_market, 'timing n/a')))
+        ELSE
+            format('%s (%s) is scheduled to report %s; consensus EPS %s.',
+                   COALESCE(f.name, ec.ticker), ec.ticker,
+                   lower(COALESCE(ec.before_after_market, 'today')),
+                   COALESCE(to_char(ec.eps_estimate, 'FM999990.00'), 'n/a'))
+        END,
+        jsonb_build_object(
+            'ticker', ec.ticker, 'name', f.name, 'sector', f.sector,
+            'market_cap', f.market_cap, 'report_date', ec.report_date,
+            'session', ec.before_after_market,
+            'eps_actual', ec.eps_actual, 'eps_estimate', ec.eps_estimate,
+            'eps_difference', ec.eps_difference, 'surprise_pct', ec.surprise_pct,
+            'status', CASE WHEN ec.eps_actual IS NOT NULL THEN 'reported' ELSE 'scheduled' END)
+    FROM earnings_calendar ec
+    LEFT JOIN fundamentals f ON f.ticker = ec.ticker
+    WHERE ec.report_date = p_issue_date
+    ORDER BY COALESCE(f.market_cap, 0) DESC
+    LIMIT (cfg('top_n') * 2)::int;
+
+    -- ================= index_overview =================
+    -- The major-markets paragraph. Returns are computed straight from
+    -- eod_prices for the configured benchmarks, independent of price_perf
+    -- (whose universe is institutional-holdings names and excludes ETFs).
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'index_overview', b.sort_order / 10, b.symbol,
+        format('%s: %s, %s%% today (%s%% 1m, %s%% YTD).',
+               b.display_name, to_char(b.close, 'FM999990.00'),
+               CASE WHEN b.ret_1d  >= 0 THEN '+' || b.ret_1d  ELSE b.ret_1d::text  END,
+               CASE WHEN b.ret_1m  >= 0 THEN '+' || b.ret_1m  ELSE b.ret_1m::text  END,
+               CASE WHEN b.ret_ytd >= 0 THEN '+' || b.ret_ytd ELSE b.ret_ytd::text END),
+        jsonb_build_object(
+            'symbol', b.symbol, 'display_name', b.display_name,
+            'as_of', b.as_of, 'close', b.close,
+            'ret_1d', b.ret_1d, 'ret_5d', b.ret_5d, 'ret_1m', b.ret_1m,
+            'ret_ytd', b.ret_ytd, 'ret_12m', b.ret_12m)
+    FROM (
+        SELECT nb.symbol, nb.display_name, nb.sort_order, p.date AS as_of, p.close,
+            round((p.close / c_1d  - 1) * 100.0, 2) AS ret_1d,
+            round((p.close / c_5d  - 1) * 100.0, 2) AS ret_5d,
+            round((p.close / c_1m  - 1) * 100.0, 2) AS ret_1m,
+            round((p.close / c_ytd - 1) * 100.0, 2) AS ret_ytd,
+            round((p.close / c_12m - 1) * 100.0, 2) AS ret_12m
+        FROM newsletter_benchmarks nb
+        JOIN LATERAL (
+            SELECT date, close FROM eod_prices e
+            WHERE e.ticker = nb.symbol AND e.close IS NOT NULL AND e.close > 0
+            ORDER BY e.date DESC LIMIT 1
+        ) p ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <  p.date                          AND e.close > 0 ORDER BY e.date DESC LIMIT 1) x1d  ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <= p.date - 7                       AND e.close > 0 ORDER BY e.date DESC LIMIT 1) x5d  ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <= p.date - 31                      AND e.close > 0 ORDER BY e.date DESC LIMIT 1) x1m  ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <  date_trunc('year', p.date)::date AND e.close > 0 ORDER BY e.date DESC LIMIT 1) xytd ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <= p.date - 365                     AND e.close > 0 ORDER BY e.date DESC LIMIT 1) x12m ON true
+        CROSS JOIN LATERAL (SELECT x1d.close AS c_1d, x5d.close AS c_5d, x1m.close AS c_1m,
+                                   xytd.close AS c_ytd, x12m.close AS c_12m) c
+    ) b
+    ORDER BY b.sort_order;
+
+    -- ================= news_recap =================
+    -- The day's financial-news recap. Most recent first, one row per distinct
+    -- headline, tone bucketed from the stored polarity so the LLM narrates a
+    -- label rather than re-deriving one.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'news_recap',
+        row_number() OVER (ORDER BY r.published_at DESC), r.ticker,
+        r.title,
+        jsonb_build_object(
+            'title', r.title, 'ticker', r.ticker, 'symbols', r.symbols,
+            'tags', r.tags, 'published_at', r.published_at, 'link', r.link,
+            'sentiment_polarity', r.sentiment_polarity,
+            'tone', CASE WHEN r.sentiment_polarity >=  0.15 THEN 'positive'
+                         WHEN r.sentiment_polarity <= -0.15 THEN 'negative'
+                         ELSE 'neutral' END)
+    FROM (
+        SELECT DISTINCT ON (n.title)
+               n.title, n.ticker, n.symbols, n.tags, n.published_at, n.link,
+               n.sentiment_polarity
+        FROM news n
+        WHERE n.published_at >= (p_issue_date::timestamptz - interval '36 hours')
+          AND n.title IS NOT NULL
+        ORDER BY n.title, n.published_at DESC
+    ) r
+    ORDER BY r.published_at DESC
+    LIMIT (cfg('top_n') * 2)::int;
 
     SELECT count(*) INTO v_count FROM newsletter_findings WHERE issue_date = p_issue_date;
     RETURN v_count;
