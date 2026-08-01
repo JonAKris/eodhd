@@ -66,6 +66,25 @@ ON CONFLICT (symbol) DO UPDATE
       sort_order   = EXCLUDED.sort_order;
 
 
+-- ---------------------------------------------------------------------
+-- Strategy signals. Populated by explorer/runner.py after a run: one row
+-- per multi-signal ticker, carrying the strategy names that flagged it and
+-- its conviction rank. build_newsletter reads this and buckets the names
+-- by analyst consensus. Not dropped on reload -- it is producer-owned data,
+-- not something the newsletter computes.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS strategy_signals (
+    issue_date        date        NOT NULL,
+    ticker            text        NOT NULL,
+    signals           text[]      NOT NULL,
+    signal_count      int         NOT NULL,
+    is_top_conviction boolean     NOT NULL DEFAULT false,
+    conviction_rank   int,
+    run_ts            timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (issue_date, ticker)
+);
+
+
 DROP TABLE IF EXISTS newsletter_findings CASCADE;
 
 CREATE TABLE newsletter_findings (
@@ -90,6 +109,7 @@ DECLARE
     v_count      integer;
     v_price_asof date;
     v_inst_asof  date;
+    v_sig_date   date;
 BEGIN
     DELETE FROM newsletter_findings WHERE issue_date = p_issue_date;
 
@@ -522,6 +542,99 @@ BEGIN
                                    xytd.close AS c_ytd, x12m.close AS c_12m) c
     ) b
     ORDER BY b.sort_order;
+
+    -- ================= strategy_picks =================
+    -- The stocks the explorer's strategies flagged, bucketed Buy/Hold/Sell by
+    -- analyst consensus. verdict lives in facts so the renderer can split the
+    -- one section into three columns. Consensus rating scale: 5 = strong buy.
+    -- Names with no analyst coverage fall into the neutral Hold bucket, flagged
+    -- rated=false so the renderer/LLM can say so rather than implying a call.
+    SELECT max(issue_date) INTO v_sig_date
+    FROM strategy_signals WHERE issue_date <= p_issue_date;
+
+    IF v_sig_date IS NULL THEN
+        -- No explorer run to classify. Emit a single status note, not an
+        -- empty section, so the renderer can say why the picks are missing.
+        INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+        VALUES (p_issue_date, 'strategy_picks', 1, NULL,
+            'No strategy run available to classify: the explorer has not persisted signals on or before this issue date.',
+            jsonb_build_object('status', 'no_run', 'signals_as_of', NULL));
+    ELSE
+        WITH latest_rating AS (
+            SELECT DISTINCT ON (ticker) ticker, date, rating, target_price,
+                   strong_buy, buy, hold, sell, strong_sell
+            FROM analyst_ratings_history
+            WHERE rating IS NOT NULL
+            ORDER BY ticker, date DESC
+        ),
+        picks AS (
+            SELECT s.ticker, s.signals, s.signal_count,
+                   s.is_top_conviction, s.conviction_rank,
+                   r.rating, r.target_price,
+                   r.strong_buy, r.buy, r.hold, r.sell, r.strong_sell,
+                   (r.rating IS NOT NULL) AS rated,
+                   CASE WHEN r.rating IS NULL THEN 'hold'   -- neutral until covered
+                        WHEN r.rating >= 3.5  THEN 'buy'
+                        WHEN r.rating >= 2.5  THEN 'hold'
+                        ELSE 'sell' END       AS verdict,
+                   f.name, f.sector,
+                   p.close, p.ret_1d, p.ret_3m, p.ret_12m
+            FROM strategy_signals s
+            LEFT JOIN latest_rating r ON r.ticker = s.ticker
+            LEFT JOIN fundamentals  f ON f.ticker = s.ticker
+            LEFT JOIN price_perf    p ON p.ticker = s.ticker
+            WHERE s.issue_date = v_sig_date
+        ),
+        ranked AS (
+            SELECT *,
+                CASE verdict WHEN 'buy' THEN 1 WHEN 'hold' THEN 2 ELSE 3 END AS vpri,
+                row_number() OVER (
+                    PARTITION BY verdict
+                    ORDER BY is_top_conviction DESC,
+                             COALESCE(conviction_rank, 2147483647),
+                             signal_count DESC, ticker
+                ) AS bucket_rank
+            FROM picks
+        )
+        INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+        SELECT p_issue_date, 'strategy_picks',
+            row_number() OVER (ORDER BY vpri, is_top_conviction DESC,
+                                        COALESCE(conviction_rank, 2147483647),
+                                        signal_count DESC, ticker),
+            ticker,
+            CASE WHEN rated THEN
+                format('%s (%s): %s on analyst consensus (%s/5 across %s ratings); flagged by %s strateg%s.',
+                       COALESCE(name, ticker), ticker, initcap(verdict),
+                       to_char(rating, 'FM90.00'),
+                       (COALESCE(strong_buy,0)+COALESCE(buy,0)+COALESCE(hold,0)+COALESCE(sell,0)+COALESCE(strong_sell,0)),
+                       signal_count, CASE WHEN signal_count = 1 THEN 'y' ELSE 'ies' END)
+            ELSE
+                format('%s (%s): Hold (no analyst coverage); flagged by %s strateg%s: %s.',
+                       COALESCE(name, ticker), ticker, signal_count,
+                       CASE WHEN signal_count = 1 THEN 'y' ELSE 'ies' END,
+                       array_to_string(signals, ', '))
+            END,
+            jsonb_build_object(
+                'ticker', ticker, 'name', name, 'sector', sector,
+                'verdict', verdict, 'rated', rated,
+                'signals_as_of', v_sig_date,
+                'signals_lag_days', (p_issue_date - v_sig_date),
+                'signals', to_jsonb(signals), 'signal_count', signal_count,
+                'is_top_conviction', is_top_conviction, 'conviction_rank', conviction_rank,
+                'consensus_rating', rating,
+                'consensus_scale_note', '5 = strong buy, 1 = strong sell.',
+                'n_ratings', (COALESCE(strong_buy,0)+COALESCE(buy,0)+COALESCE(hold,0)+COALESCE(sell,0)+COALESCE(strong_sell,0)),
+                'strong_buy', strong_buy, 'buy', buy, 'hold', hold,
+                'sell', sell, 'strong_sell', strong_sell,
+                'target_price', target_price, 'close', close,
+                'target_vs_close_pct',
+                    CASE WHEN close > 0 AND target_price IS NOT NULL
+                         THEN round((target_price/close - 1)*100.0, 2) END,
+                'ret_1d', ret_1d, 'ret_3m', ret_3m, 'ret_12m', ret_12m,
+                'bucketing_note', 'Buy/Hold/Sell reflect analyst consensus, not the strategies that surfaced the name. Unrated names default to Hold.')
+        FROM ranked
+        WHERE bucket_rank <= (cfg('top_n') * 2)::int;
+    END IF;
 
     -- ================= news_recap =================
     -- The day's financial-news recap. Most recent first, one row per distinct

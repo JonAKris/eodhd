@@ -226,6 +226,7 @@ class StockExplorer:
             facts = build_facts(top_tickers)
 
             self.save_results(all_results, multi_signal, top_tickers, facts)
+            self.persist_signals(multi_signal, top_tickers)
 
             console.print("\n[bold]Generating investment report...[/bold]")
             report = self.llm.synthesize_report(facts, all_results, universe_size=self.universe_size)
@@ -239,6 +240,55 @@ class StockExplorer:
         except Exception as e:
             logger.error(f"Fatal error: {e}", exc_info=True)
             console.print(f"[red]Fatal: {e}[/red]")
+
+    def persist_signals(self, multi_signal, top_tickers):
+        """Persist the multi-signal picks to the strategy_signals table so the
+        newsletter can bucket them by analyst consensus.
+
+        Producer-owned data: one row per multi-signal ticker for today, carrying
+        the strategy names that flagged it and (for the top conviction names)
+        its rank. Reads stay on the read-only pool; this is the one write the
+        explorer makes, through the writer pool via db.execute[_many]. A failure
+        here is logged but does not fail the run -- the file findings are still
+        written, and a stale strategy_picks section is better than no report.
+        """
+        if not multi_signal:
+            logger.info("No multi-signal tickers; skipping strategy_signals persist.")
+            return
+
+        issue_date = date.today()
+        conviction_rank = {t: i + 1 for i, (t, _) in enumerate(top_tickers)}
+        top_set = set(conviction_rank)
+
+        rows = []
+        for ticker, signals in multi_signal.items():
+            uniq = sorted(set(signals))
+            rows.append((
+                issue_date, ticker, uniq, len(uniq),
+                ticker in top_set, conviction_rank.get(ticker),
+            ))
+
+        try:
+            # Idempotent for the day: replace any earlier run's rows.
+            db.execute("DELETE FROM strategy_signals WHERE issue_date = %s", (issue_date,))
+            db.execute_many(
+                """INSERT INTO strategy_signals
+                       (issue_date, ticker, signals, signal_count,
+                        is_top_conviction, conviction_rank)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (issue_date, ticker) DO UPDATE SET
+                       signals           = EXCLUDED.signals,
+                       signal_count      = EXCLUDED.signal_count,
+                       is_top_conviction = EXCLUDED.is_top_conviction,
+                       conviction_rank   = EXCLUDED.conviction_rank,
+                       run_ts            = now()""",
+                rows,
+            )
+            console.print(f"[green]✓[/green] Persisted {len(rows)} rows to strategy_signals ({issue_date})")
+            logger.info(f"Persisted {len(rows)} strategy_signals rows for {issue_date}")
+        except Exception as exc:  # noqa: BLE001 -- persistence is best-effort
+            logger.warning(f"strategy_signals persist failed ({exc}); file findings still written.")
+            console.print(f"[yellow]○[/yellow] strategy_signals persist skipped: {str(exc)[:80]}")
 
     def save_results(self, results, multi_signal, top_tickers, facts):
         """Save raw findings"""
