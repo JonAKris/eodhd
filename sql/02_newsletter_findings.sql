@@ -85,6 +85,39 @@ CREATE TABLE IF NOT EXISTS strategy_signals (
 );
 
 
+-- ---------------------------------------------------------------------
+-- SSG results. Populated by ssg_screener.py: one row per quality-growth
+-- company with its price zone and the stricter is_buy verdict. build_newsletter
+-- buckets these Buy/Hold/Sell. Producer-owned, so not dropped on reload.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ssg_results (
+    issue_date              date    NOT NULL,
+    ticker                  text    NOT NULL,
+    name                    text,
+    sector                  text,
+    market_cap              numeric,
+    current_price           numeric,
+    zone                    text,
+    is_buy                  boolean NOT NULL DEFAULT false,
+    quality_pass            boolean NOT NULL DEFAULT false,
+    buy_below               numeric,
+    sell_above              numeric,
+    updown_ratio            numeric,
+    total_return            numeric,
+    price_appreciation_cagr numeric,
+    avg_yield               numeric,
+    forecast_high_price     numeric,
+    forecast_low_price      numeric,
+    projected_eps_5yr       numeric,
+    high_pe                 numeric,
+    low_pe                  numeric,
+    roe                     numeric,
+    reasons                 text[],
+    run_ts                  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (issue_date, ticker)
+);
+
+
 DROP TABLE IF EXISTS newsletter_findings CASCADE;
 
 CREATE TABLE newsletter_findings (
@@ -110,6 +143,7 @@ DECLARE
     v_price_asof date;
     v_inst_asof  date;
     v_sig_date   date;
+    v_ssg_date   date;
 BEGIN
     DELETE FROM newsletter_findings WHERE issue_date = p_issue_date;
 
@@ -632,6 +666,76 @@ BEGIN
                          THEN round((target_price/close - 1)*100.0, 2) END,
                 'ret_1d', ret_1d, 'ret_3m', ret_3m, 'ret_12m', ret_12m,
                 'bucketing_note', 'Buy/Hold/Sell reflect analyst consensus, not the strategies that surfaced the name. Unrated names default to Hold.')
+        FROM ranked
+        WHERE bucket_rank <= (cfg('top_n') * 2)::int;
+    END IF;
+
+    -- ================= ssg_picks =================
+    -- The Stock Selection Guide names, bucketed Buy/Hold/Sell. Buy is the
+    -- screener's stricter is_buy verdict (buy zone AND >=3:1 up/down AND total
+    -- return clears the size hurdle); Sell is the price sell zone; everything
+    -- else quality-passed -- including buy-zone near-misses -- is Hold. verdict
+    -- lives in facts so the renderer splits the one section into three columns.
+    SELECT max(issue_date) INTO v_ssg_date
+    FROM ssg_results WHERE issue_date <= p_issue_date;
+
+    IF v_ssg_date IS NULL THEN
+        INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+        VALUES (p_issue_date, 'ssg_picks', 1, NULL,
+            'No SSG screen available to classify: ssg_screener.py has not persisted results on or before this issue date.',
+            jsonb_build_object('status', 'no_run', 'ssg_as_of', NULL));
+    ELSE
+        WITH picks AS (
+            SELECT g.*,
+                CASE WHEN g.is_buy            THEN 'buy'
+                     WHEN g.zone = 'SELL'     THEN 'sell'
+                     ELSE 'hold' END AS verdict
+            FROM ssg_results g
+            WHERE g.issue_date = v_ssg_date
+              AND g.quality_pass
+        ),
+        ranked AS (
+            SELECT *,
+                CASE verdict WHEN 'buy' THEN 1 WHEN 'hold' THEN 2 ELSE 3 END AS vpri,
+                row_number() OVER (
+                    PARTITION BY verdict
+                    ORDER BY total_return DESC NULLS LAST, ticker
+                ) AS bucket_rank
+            FROM picks
+        )
+        INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+        SELECT p_issue_date, 'ssg_picks',
+            row_number() OVER (ORDER BY vpri, total_return DESC NULLS LAST, ticker),
+            ticker,
+            CASE verdict
+              WHEN 'buy' THEN
+                format('%s (%s): SSG Buy -- %s up/down, %s%% projected total return; buy below %s (now %s).',
+                       COALESCE(name, ticker), ticker,
+                       COALESCE(to_char(updown_ratio, 'FM990.0') || ':1', 'n/a'),
+                       to_char(COALESCE(total_return, 0) * 100.0, 'FM990.0'),
+                       to_char(buy_below, 'FM999990.00'), to_char(current_price, 'FM999990.00'))
+              WHEN 'sell' THEN
+                format('%s (%s): SSG Sell -- price in the sell zone (above %s; now %s).',
+                       COALESCE(name, ticker), ticker,
+                       to_char(sell_above, 'FM999990.00'), to_char(current_price, 'FM999990.00'))
+              ELSE
+                format('%s (%s): SSG Hold -- quality-growth name in the %s zone; %s%% projected total return.',
+                       COALESCE(name, ticker), ticker, lower(COALESCE(zone, 'unpriced')),
+                       to_char(COALESCE(total_return, 0) * 100.0, 'FM990.0'))
+            END,
+            jsonb_build_object(
+                'ticker', ticker, 'name', name, 'sector', sector,
+                'verdict', verdict, 'zone', zone, 'is_buy', is_buy,
+                'quality_pass', quality_pass, 'market_cap', market_cap,
+                'ssg_as_of', v_ssg_date, 'ssg_lag_days', (p_issue_date - v_ssg_date),
+                'current_price', current_price, 'buy_below', buy_below, 'sell_above', sell_above,
+                'updown_ratio', updown_ratio, 'total_return', total_return,
+                'price_appreciation_cagr', price_appreciation_cagr, 'avg_yield', avg_yield,
+                'forecast_high_price', forecast_high_price, 'forecast_low_price', forecast_low_price,
+                'projected_eps_5yr', projected_eps_5yr, 'high_pe', high_pe, 'low_pe', low_pe, 'roe', roe,
+                'reasons', to_jsonb(reasons),
+                'return_note', 'total_return and CAGR are fractions (0.15 = 15%). up/down is a ratio.',
+                'bucketing_note', 'Buy = SSG is_buy (buy zone, >=3:1 up/down, return over size hurdle). Sell = price sell zone. Hold = other quality-passed names, including buy-zone near-misses.')
         FROM ranked
         WHERE bucket_rank <= (cfg('top_n') * 2)::int;
     END IF;

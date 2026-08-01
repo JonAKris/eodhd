@@ -51,10 +51,17 @@ log = logging.getLogger("ssg_screener")
 # otherwise fall back to a self-contained psycopg connection from env vars.
 # ---------------------------------------------------------------------------
 try:
-    from db import fetch_all_ro as _fetch_all  # type: ignore -- screener is read-only
+    from db import fetch_all_ro as _fetch_all  # type: ignore -- reads are read-only
+    from db import execute as _execute, execute_many as _execute_many  # writes -> writer pool
 
     def fetch_all(sql: str, params: tuple | dict | None = None) -> list[dict]:
         return _fetch_all(sql, params)
+
+    def execute(sql: str, params: tuple | dict | None = None) -> int:
+        return _execute(sql, params)
+
+    def execute_many(sql: str, params_list: list) -> int:
+        return _execute_many(sql, params_list)
 
     _USING_PROJECT_DB = True
 except Exception:  # noqa: BLE001 -- standalone mode
@@ -92,6 +99,39 @@ except Exception:  # noqa: BLE001 -- standalone mode
         with _conn().cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
+
+    def _wdsn() -> str:
+        # Writer identity for persistence. A ready-made DATABASE_URL wins;
+        # otherwise use PG_USER/PG_PASSWORD (the writer role), never PG_RO_*.
+        url = os.getenv("DATABASE_URL")
+        if url:
+            return url
+        return (
+            f"host={os.getenv('PG_HOST', 'localhost')} "
+            f"port={os.getenv('PG_PORT', '5432')} "
+            f"dbname={os.getenv('PG_DB', 'eodhd')} "
+            f"user={os.getenv('PG_USER', 'postgres')} "
+            f"password={os.getenv('PG_PASSWORD', 'postgres')}"
+        )
+
+    _WCONN = None
+
+    def _wconn():
+        global _WCONN
+        if _WCONN is None or _WCONN.closed:
+            import psycopg
+            _WCONN = psycopg.connect(_wdsn(), autocommit=True)
+        return _WCONN
+
+    def execute(sql: str, params: tuple | dict | None = None) -> int:
+        with _wconn().cursor() as cur:
+            cur.execute(sql, params)
+            return cur.rowcount
+
+    def execute_many(sql: str, params_list: list) -> int:
+        with _wconn().cursor() as cur:
+            cur.executemany(sql, params_list)
+            return cur.rowcount
 
 
 # ===========================================================================
@@ -768,12 +808,85 @@ def run(args: argparse.Namespace) -> int:
     log.info("Quality-growth companies: %d | current buys: %d",
              len(passed), len(buys))
 
+    if not getattr(args, "no_persist", False):
+        # Persist the full quality set (not just --buys-only) so the newsletter
+        # has Buy/Hold/Sell material regardless of the CSV filter.
+        persist_results(passed)
+
     keep = buys if args.buys_only else passed
     keep.sort(key=lambda r: (r.total_return or -1), reverse=True)
 
     _write_csv(args.out, keep)
     _print_summary(keep, args.buys_only)
     return 0
+
+
+def _finite(x):
+    """Map inf/-inf/NaN to None so they never hit a numeric column.
+    The SSG up/down ratio is deliberately set to +inf when price sits at or
+    below the forecast low; that is a display concept, not a storable number.
+    """
+    if x is None:
+        return None
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return x
+    return None if not math.isfinite(xf) else x
+
+
+def persist_results(rows: list["SSGResult"], issue_date: Optional[date] = None) -> None:
+    """Upsert the quality-growth results into ssg_results for the newsletter.
+
+    Producer-owned data: build_newsletter reads this table and buckets the
+    names Buy/Hold/Sell. Best-effort -- a failure is logged but never fails the
+    screen, so the CSV output is unaffected. Idempotent per issue date.
+    """
+    if not rows:
+        log.info("No SSG rows to persist.")
+        return
+    issue_date = issue_date or date.today()
+
+    params = []
+    for r in rows:
+        params.append((
+            issue_date, r.ticker, r.name, r.sector,
+            _finite(r.market_cap), _finite(r.current_price),
+            r.zone, bool(r.is_buy), bool(r.quality_pass),
+            _finite(r.buy_below), _finite(r.sell_above), _finite(r.updown_ratio),
+            _finite(r.total_return), _finite(r.price_appreciation_cagr),
+            _finite(r.avg_yield), _finite(r.forecast_high_price),
+            _finite(r.forecast_low_price), _finite(r.projected_eps_5yr),
+            _finite(r.high_pe), _finite(r.low_pe), _finite(r.roe),
+            list(r.reasons or []),
+        ))
+
+    try:
+        execute("DELETE FROM ssg_results WHERE issue_date = %s", (issue_date,))
+        execute_many(
+            """INSERT INTO ssg_results
+                 (issue_date, ticker, name, sector, market_cap, current_price, zone,
+                  is_buy, quality_pass, buy_below, sell_above, updown_ratio, total_return,
+                  price_appreciation_cagr, avg_yield, forecast_high_price, forecast_low_price,
+                  projected_eps_5yr, high_pe, low_pe, roe, reasons)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (issue_date, ticker) DO UPDATE SET
+                  name=EXCLUDED.name, sector=EXCLUDED.sector, market_cap=EXCLUDED.market_cap,
+                  current_price=EXCLUDED.current_price, zone=EXCLUDED.zone,
+                  is_buy=EXCLUDED.is_buy, quality_pass=EXCLUDED.quality_pass,
+                  buy_below=EXCLUDED.buy_below, sell_above=EXCLUDED.sell_above,
+                  updown_ratio=EXCLUDED.updown_ratio, total_return=EXCLUDED.total_return,
+                  price_appreciation_cagr=EXCLUDED.price_appreciation_cagr,
+                  avg_yield=EXCLUDED.avg_yield, forecast_high_price=EXCLUDED.forecast_high_price,
+                  forecast_low_price=EXCLUDED.forecast_low_price,
+                  projected_eps_5yr=EXCLUDED.projected_eps_5yr, high_pe=EXCLUDED.high_pe,
+                  low_pe=EXCLUDED.low_pe, roe=EXCLUDED.roe, reasons=EXCLUDED.reasons,
+                  run_ts=now()""",
+            params,
+        )
+        log.info("Persisted %d SSG rows to ssg_results (%s)", len(params), issue_date)
+    except Exception as exc:  # noqa: BLE001 -- persistence is best-effort
+        log.warning("ssg_results persist failed (%s); CSV output unaffected.", exc)
 
 
 def _write_csv(path: str, rows: list[SSGResult]) -> None:
@@ -876,6 +989,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--out", default="ssg_results.csv", help="output CSV path")
     p.add_argument("--buys-only", action="store_true",
                    help="only keep names currently in the buy zone")
+    p.add_argument("--no-persist", action="store_true",
+                   help="skip writing results to the ssg_results table (CSV only)")
     p.add_argument("--selftest", action="store_true",
                    help="run the offline math self-test and exit")
     p.add_argument("-v", "--verbose", action="store_true")
