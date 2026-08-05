@@ -10,7 +10,7 @@ macro data into Postgres, then layers four subsystems on top:
 3. **The agent** (`agent/`) — a point-in-time signal framework: pluggable strategies
    behind one `Signal`/`Strategy`/`Context` contract, ranked across the universe.
 4. **The explorer** (`explorer/`) — an autonomous, LLM-driven job that runs SQL
-   strategies, cross-references multi-signal names, and emails a grounded morning report.
+   strategies, cross-references multi-signal names, and emails a grounded daily newsletter.
 
 Plus a factor **backtest harness** (`backtest.py`) and an SSG **screener**
 (`ssg_screener.py`).
@@ -102,24 +102,41 @@ into your refresh job via `refresh_and_bank()` (run as the writer role).
 
 An autonomous overnight job: it runs a library of SQL strategies at randomized
 parameters, cross-references tickers that light up on multiple signals, has a
-local LLM interpret the results, and emails a grounded morning report. The LLM
+local LLM interpret the results, and emails a grounded daily newsletter. The LLM
 never sees the database and does no arithmetic — it narrates pre-computed facts.
 
 ```
 explorer/
-  runner.py         orchestrates strategies → cross-reference → report
+  runner.py         orchestrates strategies → cross-reference → persist signals
   sql_strategies.py library of SQL strategies (value/quality, momentum, holder
                     conviction, congressional trades, earnings, dividends, …)
   llm.py            Ollama interface (schema-constrained JSON, JSON repair)
-  morning_report.py assembles + emails the HTML report
+  newsletter.py     builds + emails the daily newsletter (the scheduled deliverable)
+  morning_report.py shared email + HTML-template scaffolding; also runs standalone
 ```
+
+The newsletter is assembled on a strict **SQL → JSON → renderer** contract
+(`sql/02_newsletter_findings.sql`): `build_newsletter()` computes every figure and
+writes it to `newsletter_findings`, `newsletter_payload()` returns it as JSON, and
+`newsletter.py` only renders — it never computes. Sections: market open, major
+markets, most active movers (top advancers / decliners in the liquid universe), a
+cap-weighted sector heat map, strategy picks, the Stock Selection Guide, and a
+news recap.
 
 ```bash
-python -m explorer.runner          # one exploration cycle → findings/
+python -m explorer.runner                                # one exploration cycle → findings/ + strategy_signals
+python -m explorer.newsletter --no-email --out out.html  # build + render only, don't send
+python -m explorer.newsletter                            # build + email today's issue
 ```
 
-Runs read-only. Schedule it with the `systemd/` units (which pin the process to
-the read-only DB role); adjust the timer to land before your morning slot.
+The exploration cycle (`runner.py`) reads **read-only**, with one exception: it
+persists the day's multi-signal picks to `strategy_signals` through the writer
+pool, and the newsletter's strategy-picks section reads them back. Building the
+newsletter also writes (`build_newsletter()` populates `newsletter_findings`), so
+that step runs as the **writer** role — the `systemd/` `ExecStartPost` overrides
+`PG_USER` to the writer for the newsletter only, while exploration stays on the
+read-only role. Schedule the whole thing with the `systemd/` units; adjust the
+timer to land before your morning slot.
 
 ---
 
@@ -155,13 +172,14 @@ deliberate safety boundary — one that `db.py` now enforces in code by opening 
 separate pool per role, rather than leaving it to convention:
 
 - **Writer** (`PG_USER` / `PG_PASSWORD`) — ingest, view refresh, vintage banking,
-  and portfolio/trade CRUD. The default `db.py` helpers (`fetch_all`, `execute`,
+  portfolio/trade CRUD, and the explorer's two writes (persisting `strategy_signals`
+  and building the newsletter). The default `db.py` helpers (`fetch_all`, `execute`,
   …) use this pool.
-- **Read-only** (`PG_RO_USER` / `PG_RO_PASSWORD`) — the agent, the explorer, and
-  the dashboard's market-data reads. These go through `db.fetch_all_ro` /
-  `fetch_one_ro` (and, for the agent, `Context.from_dsn()`), which connect via
-  `config.ro_dsn`. Grant this role `SELECT` only. It falls back to the writer
-  identity when `PG_RO_*` is unset, so a single-role setup still works.
+- **Read-only** (`PG_RO_USER` / `PG_RO_PASSWORD`) — the agent, the explorer's
+  exploration reads, and the dashboard's market-data reads. These go through
+  `db.fetch_all_ro` / `fetch_one_ro` (and, for the agent, `Context.from_dsn()`),
+  which connect via `config.ro_dsn`. Grant this role `SELECT` only. It falls back
+  to the writer identity when `PG_RO_*` is unset, so a single-role setup still works.
 
 The dashboard therefore uses **both** identities: it browses market data through
 the read-only role, and performs portfolio/trade writes through the writer role
