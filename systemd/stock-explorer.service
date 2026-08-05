@@ -1,5 +1,5 @@
 [Unit]
-Description=Stock Explorer Agent (autonomous LLM exploration -> morning report)
+Description=Stock Explorer Agent (autonomous LLM exploration -> daily newsletter)
 After=network-online.target postgresql.service ollama.service
 Wants=network-online.target
 
@@ -10,25 +10,28 @@ Group=jon
 WorkingDirectory=/home/jon/eodhd
 Environment=PYTHONUNBUFFERED=1
 
-# Read-only DB identity: the explorer must never write. This pins the whole
-# process to the read-only role at the database level (matches the grant
-# boundary: jon writes, ai_agent reads). config.py also exposes ro_dsn if you
-# later split db.py into writer/reader pools.
-Environment=PG_USER=ai_agent
-
-# .env in the repo root supplies PG_PASSWORD (for ai_agent here), OLLAMA_HOST,
-# EXPLORATION_MODEL, ANALYSIS_MODEL, SMTP_*, etc. config.py loads it on import.
+# Database identities come entirely from .env (config.py loads it on import):
+#   PG_USER / PG_PASSWORD        -- writer role (jon)
+#   PG_RO_USER / PG_RO_PASSWORD  -- read-only role (ai_agent)
+# The read-only boundary is enforced in code, not by pinning the process: the
+# runner does every read through db.fetch_*_ro (ro_dsn / PG_RO_USER) and makes
+# exactly one write -- persisting strategy_signals -- through the writer pool
+# (dsn / PG_USER). Pinning PG_USER=ai_agent here would collapse the writer pool
+# onto the read-only role and silently break that persist (and the newsletter's
+# strategy-picks section), so we deliberately do NOT set it.
+#   PREREQUISITE: PG_RO_USER / PG_RO_PASSWORD must be set in .env. If they are
+#   blank, ro_dsn falls back to the writer identity and the boundary is lost.
+#
+# .env also supplies OLLAMA_HOST, EXPLORATION_MODEL, ANALYSIS_MODEL, SMTP_*, etc.
 # If you prefer, point at it explicitly instead of relying on WorkingDirectory:
 # EnvironmentFile=/home/jon/eodhd/.env
 
 ExecStart=/home/jon/eodhd/venv/bin/python -m explorer.runner
 
 # Publish + email the daily newsletter right after exploration finishes.
-# build_newsletter() WRITES newsletter_findings, so this step must run as
-# the writer role -- override the unit's read-only PG_USER=ai_agent back to
-# the writer identity for this step only. PG_PASSWORD still comes from .env,
-# and reads keep using PG_RO_USER=ai_agent. Exploration above stays read-only.
-ExecStartPost=/usr/bin/env PG_USER=jon /home/jon/eodhd/venv/bin/python -m explorer.newsletter
+# build_newsletter() writes newsletter_findings through the writer pool, which
+# resolves to PG_USER from .env (the writer) -- no per-step override needed.
+ExecStartPost=/home/jon/eodhd/venv/bin/python -m explorer.newsletter
 
 Nice=10
 TimeoutStartSec=3600

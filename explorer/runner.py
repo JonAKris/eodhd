@@ -287,8 +287,40 @@ class StockExplorer:
             console.print(f"[green]✓[/green] Persisted {len(rows)} rows to strategy_signals ({issue_date})")
             logger.info(f"Persisted {len(rows)} strategy_signals rows for {issue_date}")
         except Exception as exc:  # noqa: BLE001 -- persistence is best-effort
-            logger.warning(f"strategy_signals persist failed ({exc}); file findings still written.")
-            console.print(f"[yellow]○[/yellow] strategy_signals persist skipped: {str(exc)[:80]}")
+            logger.error(
+                f"strategy_signals persist FAILED ({exc}); file findings are still "
+                "written, but the newsletter's strategy-picks section will be empty. "
+                "If this is a permission error, PG_USER is resolving to the read-only "
+                "role instead of the writer.",
+                exc_info=True,
+            )
+            console.print(f"[red]✗[/red] strategy_signals persist FAILED: {str(exc)[:80]}")
+            return
+
+        # Verify the write is actually visible (committed, correct role). A silent
+        # empty table here is exactly what kept the strategy-picks section blank,
+        # so a shortfall is an error, not a shrug. Read back through the RO pool so
+        # this also confirms the rows are committed and visible to other roles.
+        try:
+            check = db.fetch_one_ro(
+                "SELECT count(*) AS n FROM strategy_signals WHERE issue_date = %s",
+                (issue_date,),
+            )
+            persisted = (check or {}).get("n", 0)
+            if persisted < len(rows):
+                logger.error(
+                    f"strategy_signals verification failed: expected {len(rows)} "
+                    f"rows for {issue_date}, found {persisted}. The newsletter's "
+                    "strategy-picks section will be short or empty."
+                )
+                console.print(
+                    f"[red]✗[/red] strategy_signals verify: {persisted}/{len(rows)} "
+                    f"rows for {issue_date}"
+                )
+            else:
+                logger.info(f"Verified {persisted} strategy_signals rows for {issue_date}")
+        except Exception as exc:  # noqa: BLE001 -- verification must not fail the run
+            logger.error(f"strategy_signals verification query failed ({exc}).", exc_info=True)
 
     def save_results(self, results, multi_signal, top_tickers, facts):
         """Save raw findings"""
