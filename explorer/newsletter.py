@@ -9,9 +9,11 @@ that document and lays it out, in a fixed reader-facing order:
 
   1. Opening    -- market holidays (if any) and today's earnings reports
   2. Major markets -- the benchmark indices (DOW, S&P, Nasdaq, ...)
-  3. Strategy picks -- explorer signals, bucketed Buy / Hold / Sell
-  4. Stock Selection Guide -- SSG names, bucketed Buy / Hold / Sell
-  5. News recap -- the day's financial headlines
+  3. Most active movers -- top advancers / decliners in the liquid universe
+  4. Sector heat map -- cap-weighted 1-day return by sector
+  5. Strategy picks -- explorer signals, bucketed Buy / Hold / Sell
+  6. Stock Selection Guide -- SSG names, bucketed Buy / Hold / Sell
+  7. News recap -- the day's financial headlines
 
 The model, if narration is enabled, only rewrites prose from the supplied
 facts. It never computes a number: every figure in the email comes from SQL.
@@ -42,6 +44,8 @@ log = logging.getLogger("newsletter")
 SECTION_ORDER = [
     "opening",          # synthesized from market_holidays + earnings_reports
     "index_overview",
+    "movers",           # synthesized from movers_advancing + movers_declining
+    "sector_heatmap",
     "strategy_picks",
     "ssg_picks",
     "news_recap",
@@ -53,6 +57,16 @@ BUCKETS = [("buy", "Buy"), ("hold", "Hold"), ("sell", "Sell")]
 POS = "#137333"   # green
 NEG = "#c5221f"   # red
 NEUT = "#5f6368"  # grey
+
+# Sector heat-map palette: a pale neutral blended toward saturated green/red by
+# |return| / HEAT_FULL_SCALE. This is presentation only -- like _color(), it maps
+# a SQL-computed figure to a colour; it never computes a figure. Tune the scale
+# (the |1d %| at which a cell is fully saturated) to taste.
+HEAT_FULL_SCALE = 3.0
+_HEAT_BASE = (240, 243, 246)   # #f0f3f6 pale grey
+_HEAT_POS = (19, 115, 51)      # POS
+_HEAT_NEG = (197, 34, 31)      # NEG
+HEAT_COLS = 3                  # sector cells per row in the grid
 
 
 # --------------------------------------------------------------------------- #
@@ -91,6 +105,34 @@ def _color(v) -> str:
     if f is None or f == 0:
         return NEUT
     return POS if f > 0 else NEG
+
+
+def _compact_int(v) -> str:
+    """Compact a large count for narrow table cells: 62000000 -> '62.0M'."""
+    f = _f(v)
+    if f is None:
+        return "n/a"
+    a = abs(f)
+    for div, suf in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if a >= div:
+            return f"{f / div:.1f}{suf}"
+    return f"{f:.0f}"
+
+
+def _heat_color(v, full_scale: float = HEAT_FULL_SCALE) -> tuple[str, str]:
+    """Map a signed percent return to (background_hex, text_hex) for a heat cell.
+
+    ``full_scale`` is the |return| at which the cell reaches full saturation.
+    Presentation only: it colours a figure, it never derives one.
+    """
+    f = _f(v)
+    if f is None or not full_scale:
+        return "#eef2f5", NEUT
+    t = max(-1.0, min(1.0, f / full_scale))
+    target = _HEAT_POS if t >= 0 else _HEAT_NEG
+    mag = abs(t)
+    rgb = tuple(round(b + mag * (c - b)) for b, c in zip(_HEAT_BASE, target))
+    return "#%02x%02x%02x" % rgb, ("#ffffff" if mag >= 0.55 else "#0b1f33")
 
 
 def _esc(s) -> str:
@@ -223,6 +265,71 @@ def _render_index_overview(payload: dict) -> str:
     return "<h2>Major markets</h2>\n<table>\n" + "\n".join(rows) + "\n</table>"
 
 
+def _movers_table(items: list[dict]) -> str:
+    rows = ['<tr><th>Ticker</th><th>Company</th><th>Last</th>'
+            '<th>1d</th><th>Vol</th></tr>']
+    for it in items:
+        f = _facts(it)
+        rows.append(
+            "<tr>"
+            f"<td><strong>{_esc(f.get('ticker'))}</strong></td>"
+            f"<td>{_esc(f.get('name') or f.get('ticker'))}</td>"
+            f"<td>{_money(f.get('close'))}</td>"
+            f'<td style="color:{_color(f.get("ret_1d"))}">{_pct(f.get("ret_1d"), signed=True)}</td>'
+            f"<td>{_compact_int(f.get('volume'))}</td>"
+            "</tr>"
+        )
+    return "<table>\n" + "\n".join(rows) + "\n</table>"
+
+
+def _render_movers(payload: dict) -> str:
+    adv = _items(payload, "movers_advancing")
+    dec = _items(payload, "movers_declining")
+    if not adv and not dec:
+        return ""
+    parts = ["<h2>Most active movers</h2>"]
+    if adv:
+        parts.append(f"<h3>Advancing ({len(adv)})</h3>")
+        parts.append(_movers_table(adv))
+    if dec:
+        parts.append(f"<h3>Declining ({len(dec)})</h3>")
+        parts.append(_movers_table(dec))
+    return "\n".join(parts)
+
+
+def _render_sector_heatmap(payload: dict) -> str:
+    items = _items(payload, "sector_heatmap")
+    if not items:
+        return ""
+    cells = []
+    for it in items:
+        f = _facts(it)
+        bg, fg = _heat_color(f.get("weighted_ret_1d"))
+        breadth = (f"{f.get('n_advancing', 0)}&#9650; / "
+                   f"{f.get('n_declining', 0)}&#9660;")
+        # width + white border make a gap-separated grid that survives Outlook,
+        # which ignores border-spacing. white-space:normal counters the mobile
+        # rule that sets nowrap on .content tables.
+        cells.append(
+            f'<td width="{100 // HEAT_COLS}%" style="background:{bg};color:{fg};'
+            'padding:12px;border:2px solid #ffffff;vertical-align:top;'
+            'white-space:normal">'
+            f'<div style="font-weight:700;font-size:14px">{_esc(f.get("sector"))}</div>'
+            f'<div style="font-size:19px;font-weight:700;margin:2px 0">'
+            f'{_pct(f.get("weighted_ret_1d"), signed=True)}</div>'
+            f'<div style="font-size:12px">{breadth}</div>'
+            "</td>"
+        )
+    grid = ["<tr>" + "".join(cells[i:i + HEAT_COLS]) + "</tr>"
+            for i in range(0, len(cells), HEAT_COLS)]
+    return ('<h2>Sector heat map</h2>\n'
+            '<p style="font-size:13px;color:#5f6368;margin:0 0 8px">'
+            'Cap-weighted 1-day return by sector; arrows show advancers / decliners.</p>\n'
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            'style="border-collapse:separate;border-spacing:0;margin:8px 0">\n'
+            + "\n".join(grid) + "\n</table>")
+
+
 def _bucketed(items: list[dict]) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {"buy": [], "hold": [], "sell": []}
     for it in items:
@@ -331,6 +438,8 @@ def render_html_body(payload: dict, issue_date: date, narrate: bool = False) -> 
     parts = [f"<h1>Daily Market Newsletter</h1>", f"<p><em>{today}</em></p>"]
     parts.append(_render_opening(payload, narrate))
     parts.append(_render_index_overview(payload))
+    parts.append(_render_movers(payload))
+    parts.append(_render_sector_heatmap(payload))
     parts.append(_render_picks(payload, "strategy_picks", "Strategy picks", _render_strategy_line))
     parts.append(_render_picks(payload, "ssg_picks", "Stock Selection Guide", _render_ssg_line))
     parts.append(_render_news(payload, narrate))
@@ -343,10 +452,14 @@ def render_text_body(payload: dict, issue_date: date) -> str:
     lines = [f"DAILY MARKET NEWSLETTER -- {issue_date.isoformat()}", ""]
     labels = {
         "market_holidays": "MARKET HOLIDAYS", "earnings_reports": "EARNINGS TODAY",
-        "index_overview": "MAJOR MARKETS", "strategy_picks": "STRATEGY PICKS",
+        "index_overview": "MAJOR MARKETS",
+        "movers_advancing": "MOST ACTIVE -- ADVANCING",
+        "movers_declining": "MOST ACTIVE -- DECLINING",
+        "sector_heatmap": "SECTOR HEAT MAP", "strategy_picks": "STRATEGY PICKS",
         "ssg_picks": "STOCK SELECTION GUIDE", "news_recap": "NEWS RECAP",
     }
     for section in ["market_holidays", "earnings_reports", "index_overview",
+                    "movers_advancing", "movers_declining", "sector_heatmap",
                     "strategy_picks", "ssg_picks", "news_recap"]:
         items = _items(payload, section)
         if not items:

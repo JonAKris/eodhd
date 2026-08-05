@@ -36,7 +36,8 @@ INSERT INTO newsletter_config (key, value, note) VALUES
   ('min_holders',      5,      'Top-N holders required for a ticker to be rankable'),
   ('min_prior_shares', 50000,  'Baseline floor. EODHD change_p hits +1342% on a 23k base'),
   ('min_holders_at_latest', 4, 'Net flow needs enough current filers to mean anything'),
-  ('top_n',            5,      'Rows per section');
+  ('top_n',            5,      'Rows per section'),
+  ('top_n_movers',     10,     'Rows per movers section (advancing / declining)');
 
 CREATE OR REPLACE FUNCTION cfg(p_key text) RETURNS numeric
 LANGUAGE sql STABLE AS $$
@@ -766,6 +767,91 @@ BEGIN
     ) r
     ORDER BY r.published_at DESC
     LIMIT (cfg('top_n') * 2)::int;
+
+    -- ================= movers_advancing / movers_declining =================
+    -- Top gainers and losers in the liquid universe (price_perf already excludes
+    -- ETFs and non-holdings names). The min_price / min_avg_vol_20d floors keep
+    -- this out of microcap-noise territory -- see the notes on those config keys.
+    -- Ranked by 1-day return, volume breaking ties so the "most active" of two
+    -- equal movers sorts first.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'movers_advancing',
+        row_number() OVER (ORDER BY pp.ret_1d DESC, pp.volume DESC),
+        pp.ticker,
+        format('%s (%s) +%s%% on %s shares.',
+               coalesce(f.name, pp.ticker), pp.ticker, pp.ret_1d,
+               to_char(pp.volume, 'FM999,999,999,999')),
+        jsonb_build_object(
+            'ticker', pp.ticker, 'name', f.name, 'sector', f.sector,
+            'as_of', pp.as_of, 'close', pp.close, 'ret_1d', pp.ret_1d,
+            'ret_5d', pp.ret_5d, 'volume', pp.volume, 'avg_vol_20d', pp.avg_vol_20d,
+            'vol_ratio', pp.vol_ratio, 'dollar_volume', round(pp.close * pp.volume))
+    FROM price_perf pp
+    LEFT JOIN fundamentals f ON f.ticker = pp.ticker
+    WHERE pp.ret_1d IS NOT NULL AND pp.ret_1d > 0
+      AND pp.close       >= cfg('min_price')
+      AND pp.avg_vol_20d >= cfg('min_avg_vol_20d')
+      AND coalesce(f.is_delisted, false) = false
+    ORDER BY pp.ret_1d DESC, pp.volume DESC
+    LIMIT cfg('top_n_movers')::int;
+
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'movers_declining',
+        row_number() OVER (ORDER BY pp.ret_1d ASC, pp.volume DESC),
+        pp.ticker,
+        format('%s (%s) %s%% on %s shares.',
+               coalesce(f.name, pp.ticker), pp.ticker, pp.ret_1d,
+               to_char(pp.volume, 'FM999,999,999,999')),
+        jsonb_build_object(
+            'ticker', pp.ticker, 'name', f.name, 'sector', f.sector,
+            'as_of', pp.as_of, 'close', pp.close, 'ret_1d', pp.ret_1d,
+            'ret_5d', pp.ret_5d, 'volume', pp.volume, 'avg_vol_20d', pp.avg_vol_20d,
+            'vol_ratio', pp.vol_ratio, 'dollar_volume', round(pp.close * pp.volume))
+    FROM price_perf pp
+    LEFT JOIN fundamentals f ON f.ticker = pp.ticker
+    WHERE pp.ret_1d IS NOT NULL AND pp.ret_1d < 0
+      AND pp.close       >= cfg('min_price')
+      AND pp.avg_vol_20d >= cfg('min_avg_vol_20d')
+      AND coalesce(f.is_delisted, false) = false
+    ORDER BY pp.ret_1d ASC, pp.volume DESC
+    LIMIT cfg('top_n_movers')::int;
+
+    -- ================= sector_heatmap =================
+    -- One row per sector: the cap-weighted 1-day return across that sector's
+    -- constituents in the same liquid universe as the movers, plus breadth
+    -- (advancers / decliners). Cap-weighting mirrors how a real sector tile is
+    -- built and keeps a single large name from being drowned out by small ones.
+    -- Ranked strongest-to-weakest so the renderer lays the grid out in order.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'sector_heatmap',
+        row_number() OVER (ORDER BY s.wret DESC NULLS LAST),
+        NULL,
+        format('%s: %s%% cap-weighted across %s names (%s up / %s down).',
+               s.sector,
+               CASE WHEN s.wret >= 0 THEN '+' || s.wret ELSE s.wret::text END,
+               s.n, s.n_adv, s.n_dec),
+        jsonb_build_object(
+            'sector', s.sector, 'weighted_ret_1d', s.wret, 'avg_ret_1d', s.aret,
+            'n', s.n, 'n_advancing', s.n_adv, 'n_declining', s.n_dec,
+            'total_market_cap', s.mktcap)
+    FROM (
+        SELECT f.sector,
+               round(sum(pp.ret_1d * f.market_cap) / nullif(sum(f.market_cap), 0), 2) AS wret,
+               round(avg(pp.ret_1d), 2) AS aret,
+               count(*) AS n,
+               count(*) FILTER (WHERE pp.ret_1d > 0) AS n_adv,
+               count(*) FILTER (WHERE pp.ret_1d < 0) AS n_dec,
+               sum(f.market_cap) AS mktcap
+        FROM price_perf pp
+        JOIN fundamentals f ON f.ticker = pp.ticker
+        WHERE pp.ret_1d IS NOT NULL
+          AND f.sector IS NOT NULL
+          AND f.market_cap IS NOT NULL AND f.market_cap > 0
+          AND pp.close       >= cfg('min_price')
+          AND pp.avg_vol_20d >= cfg('min_avg_vol_20d')
+          AND coalesce(f.is_delisted, false) = false
+        GROUP BY f.sector
+    ) s;
 
     SELECT count(*) INTO v_count FROM newsletter_findings WHERE issue_date = p_issue_date;
     RETURN v_count;

@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict KtC0bvjyrNf5ahEbmRdKuSQ7Uc3RKOxaxO0I0ZiV5Bnx8jnqdIxZETV9WsL4SHs
+\restrict AtqcZqfohcoKIwgfcGcDpdwJG4H8oZNaXTBXg67TG042vA4suh63vrfcdY4kC6E
 
 -- Dumped from database version 16.14 (Ubuntu 16.14-1.pgdg24.04+1)
 -- Dumped by pg_dump version 16.14 (Ubuntu 16.14-1.pgdg24.04+1)
@@ -123,6 +123,8 @@ DECLARE
     v_count      integer;
     v_price_asof date;
     v_inst_asof  date;
+    v_sig_date   date;
+    v_ssg_date   date;
 BEGIN
     DELETE FROM newsletter_findings WHERE issue_date = p_issue_date;
 
@@ -446,6 +448,390 @@ BEGIN
     LEFT JOIN fundamentals f ON f.ticker = d.ticker
     LEFT JOIN price_perf   p ON p.ticker = d.ticker
     ORDER BY abs(d.drift) DESC LIMIT cfg('top_n')::int;
+
+    -- ================= market_holidays =================
+    -- Opening-paragraph context: is the US market closed today, and when is
+    -- the next closure? Parsed defensively from exchange_details.holidays,
+    -- whose sub-object key spellings vary across EODHD payloads.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'market_holidays',
+        row_number() OVER (ORDER BY h.hdate),
+        NULL,
+        CASE WHEN h.hdate = p_issue_date
+             THEN format('US markets are closed today for %s.', h.name)
+             ELSE format('Next US market holiday: %s on %s (%s days away).',
+                         h.name, h.hdate, (h.hdate - p_issue_date)) END,
+        jsonb_build_object(
+            'exchange', 'US', 'name', h.name, 'type', h.htype, 'date', h.hdate,
+            'is_today', (h.hdate = p_issue_date),
+            'days_away', (h.hdate - p_issue_date))
+    FROM (
+        SELECT
+            COALESCE(v.value->>'Holiday', v.value->>'Name',
+                     v.value->>'holiday', v.key)                 AS name,
+            COALESCE(v.value->>'Type', v.value->>'type')         AS htype,
+            NULLIF(COALESCE(v.value->>'Date', v.value->>'date'), '')::date AS hdate
+        FROM exchange_details ed
+        CROSS JOIN LATERAL jsonb_each(ed.holidays) AS v(key, value)
+        WHERE ed.exchange_code = 'US'
+    ) h
+    -- today's closure, plus the single nearest upcoming one
+    WHERE h.hdate = p_issue_date
+       OR h.hdate = (SELECT min(x.hdate) FROM (
+               SELECT NULLIF(COALESCE(v.value->>'Date', v.value->>'date'), '')::date AS hdate
+               FROM exchange_details ed
+               CROSS JOIN LATERAL jsonb_each(ed.holidays) AS v(key, value)
+               WHERE ed.exchange_code = 'US'
+           ) x WHERE x.hdate > p_issue_date)
+    ORDER BY h.hdate;
+
+    -- ================= earnings_reports =================
+    -- Companies reporting on the issue date. Actuals vs estimate when the
+    -- print has landed, otherwise the scheduled session. Ranked by size so
+    -- the most consequential names lead the paragraph.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'earnings_reports',
+        row_number() OVER (ORDER BY COALESCE(f.market_cap, 0) DESC),
+        ec.ticker,
+        CASE WHEN ec.eps_actual IS NOT NULL THEN
+            format('%s (%s) reported EPS of %s vs %s estimate (%s%% surprise), %s.',
+                   COALESCE(f.name, ec.ticker), ec.ticker,
+                   to_char(ec.eps_actual,   'FM999990.00'),
+                   to_char(ec.eps_estimate, 'FM999990.00'),
+                   to_char(ec.surprise_pct, 'FM999990.0'),
+                   lower(COALESCE(ec.before_after_market, 'timing n/a')))
+        ELSE
+            format('%s (%s) is scheduled to report %s; consensus EPS %s.',
+                   COALESCE(f.name, ec.ticker), ec.ticker,
+                   lower(COALESCE(ec.before_after_market, 'today')),
+                   COALESCE(to_char(ec.eps_estimate, 'FM999990.00'), 'n/a'))
+        END,
+        jsonb_build_object(
+            'ticker', ec.ticker, 'name', f.name, 'sector', f.sector,
+            'market_cap', f.market_cap, 'report_date', ec.report_date,
+            'session', ec.before_after_market,
+            'eps_actual', ec.eps_actual, 'eps_estimate', ec.eps_estimate,
+            'eps_difference', ec.eps_difference, 'surprise_pct', ec.surprise_pct,
+            'status', CASE WHEN ec.eps_actual IS NOT NULL THEN 'reported' ELSE 'scheduled' END)
+    FROM earnings_calendar ec
+    LEFT JOIN fundamentals f ON f.ticker = ec.ticker
+    WHERE ec.report_date = p_issue_date
+    ORDER BY COALESCE(f.market_cap, 0) DESC
+    LIMIT (cfg('top_n') * 2)::int;
+
+    -- ================= index_overview =================
+    -- The major-markets paragraph. Returns are computed straight from
+    -- eod_prices for the configured benchmarks, independent of price_perf
+    -- (whose universe is institutional-holdings names and excludes ETFs).
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'index_overview', b.sort_order / 10, b.symbol,
+        format('%s: %s, %s%% today (%s%% 1m, %s%% YTD).',
+               b.display_name, to_char(b.close, 'FM999990.00'),
+               CASE WHEN b.ret_1d  >= 0 THEN '+' || b.ret_1d  ELSE b.ret_1d::text  END,
+               CASE WHEN b.ret_1m  >= 0 THEN '+' || b.ret_1m  ELSE b.ret_1m::text  END,
+               CASE WHEN b.ret_ytd >= 0 THEN '+' || b.ret_ytd ELSE b.ret_ytd::text END),
+        jsonb_build_object(
+            'symbol', b.symbol, 'display_name', b.display_name,
+            'as_of', b.as_of, 'close', b.close,
+            'ret_1d', b.ret_1d, 'ret_5d', b.ret_5d, 'ret_1m', b.ret_1m,
+            'ret_ytd', b.ret_ytd, 'ret_12m', b.ret_12m)
+    FROM (
+        SELECT nb.symbol, nb.display_name, nb.sort_order, p.date AS as_of, p.close,
+            round((p.close / c_1d  - 1) * 100.0, 2) AS ret_1d,
+            round((p.close / c_5d  - 1) * 100.0, 2) AS ret_5d,
+            round((p.close / c_1m  - 1) * 100.0, 2) AS ret_1m,
+            round((p.close / c_ytd - 1) * 100.0, 2) AS ret_ytd,
+            round((p.close / c_12m - 1) * 100.0, 2) AS ret_12m
+        FROM newsletter_benchmarks nb
+        JOIN LATERAL (
+            SELECT date, close FROM eod_prices e
+            WHERE e.ticker = nb.symbol AND e.close IS NOT NULL AND e.close > 0
+            ORDER BY e.date DESC LIMIT 1
+        ) p ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <  p.date                          AND e.close > 0 ORDER BY e.date DESC LIMIT 1) x1d  ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <= p.date - 7                       AND e.close > 0 ORDER BY e.date DESC LIMIT 1) x5d  ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <= p.date - 31                      AND e.close > 0 ORDER BY e.date DESC LIMIT 1) x1m  ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <  date_trunc('year', p.date)::date AND e.close > 0 ORDER BY e.date DESC LIMIT 1) xytd ON true
+        LEFT JOIN LATERAL (SELECT close FROM eod_prices e WHERE e.ticker = nb.symbol AND e.date <= p.date - 365                     AND e.close > 0 ORDER BY e.date DESC LIMIT 1) x12m ON true
+        CROSS JOIN LATERAL (SELECT x1d.close AS c_1d, x5d.close AS c_5d, x1m.close AS c_1m,
+                                   xytd.close AS c_ytd, x12m.close AS c_12m) c
+    ) b
+    ORDER BY b.sort_order;
+
+    -- ================= strategy_picks =================
+    -- The stocks the explorer's strategies flagged, bucketed Buy/Hold/Sell by
+    -- analyst consensus. verdict lives in facts so the renderer can split the
+    -- one section into three columns. Consensus rating scale: 5 = strong buy.
+    -- Names with no analyst coverage fall into the neutral Hold bucket, flagged
+    -- rated=false so the renderer/LLM can say so rather than implying a call.
+    SELECT max(issue_date) INTO v_sig_date
+    FROM strategy_signals WHERE issue_date <= p_issue_date;
+
+    IF v_sig_date IS NULL THEN
+        -- No explorer run to classify. Emit a single status note, not an
+        -- empty section, so the renderer can say why the picks are missing.
+        INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+        VALUES (p_issue_date, 'strategy_picks', 1, NULL,
+            'No strategy run available to classify: the explorer has not persisted signals on or before this issue date.',
+            jsonb_build_object('status', 'no_run', 'signals_as_of', NULL));
+    ELSE
+        WITH latest_rating AS (
+            SELECT DISTINCT ON (ticker) ticker, date, rating, target_price,
+                   strong_buy, buy, hold, sell, strong_sell
+            FROM analyst_ratings_history
+            WHERE rating IS NOT NULL
+            ORDER BY ticker, date DESC
+        ),
+        picks AS (
+            SELECT s.ticker, s.signals, s.signal_count,
+                   s.is_top_conviction, s.conviction_rank,
+                   r.rating, r.target_price,
+                   r.strong_buy, r.buy, r.hold, r.sell, r.strong_sell,
+                   (r.rating IS NOT NULL) AS rated,
+                   CASE WHEN r.rating IS NULL THEN 'hold'   -- neutral until covered
+                        WHEN r.rating >= 3.5  THEN 'buy'
+                        WHEN r.rating >= 2.5  THEN 'hold'
+                        ELSE 'sell' END       AS verdict,
+                   f.name, f.sector,
+                   p.close, p.ret_1d, p.ret_3m, p.ret_12m
+            FROM strategy_signals s
+            LEFT JOIN latest_rating r ON r.ticker = s.ticker
+            LEFT JOIN fundamentals  f ON f.ticker = s.ticker
+            LEFT JOIN price_perf    p ON p.ticker = s.ticker
+            WHERE s.issue_date = v_sig_date
+        ),
+        ranked AS (
+            SELECT *,
+                CASE verdict WHEN 'buy' THEN 1 WHEN 'hold' THEN 2 ELSE 3 END AS vpri,
+                row_number() OVER (
+                    PARTITION BY verdict
+                    ORDER BY is_top_conviction DESC,
+                             COALESCE(conviction_rank, 2147483647),
+                             signal_count DESC, ticker
+                ) AS bucket_rank
+            FROM picks
+        )
+        INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+        SELECT p_issue_date, 'strategy_picks',
+            row_number() OVER (ORDER BY vpri, is_top_conviction DESC,
+                                        COALESCE(conviction_rank, 2147483647),
+                                        signal_count DESC, ticker),
+            ticker,
+            CASE WHEN rated THEN
+                format('%s (%s): %s on analyst consensus (%s/5 across %s ratings); flagged by %s strateg%s.',
+                       COALESCE(name, ticker), ticker, initcap(verdict),
+                       to_char(rating, 'FM90.00'),
+                       (COALESCE(strong_buy,0)+COALESCE(buy,0)+COALESCE(hold,0)+COALESCE(sell,0)+COALESCE(strong_sell,0)),
+                       signal_count, CASE WHEN signal_count = 1 THEN 'y' ELSE 'ies' END)
+            ELSE
+                format('%s (%s): Hold (no analyst coverage); flagged by %s strateg%s: %s.',
+                       COALESCE(name, ticker), ticker, signal_count,
+                       CASE WHEN signal_count = 1 THEN 'y' ELSE 'ies' END,
+                       array_to_string(signals, ', '))
+            END,
+            jsonb_build_object(
+                'ticker', ticker, 'name', name, 'sector', sector,
+                'verdict', verdict, 'rated', rated,
+                'signals_as_of', v_sig_date,
+                'signals_lag_days', (p_issue_date - v_sig_date),
+                'signals', to_jsonb(signals), 'signal_count', signal_count,
+                'is_top_conviction', is_top_conviction, 'conviction_rank', conviction_rank,
+                'consensus_rating', rating,
+                'consensus_scale_note', '5 = strong buy, 1 = strong sell.',
+                'n_ratings', (COALESCE(strong_buy,0)+COALESCE(buy,0)+COALESCE(hold,0)+COALESCE(sell,0)+COALESCE(strong_sell,0)),
+                'strong_buy', strong_buy, 'buy', buy, 'hold', hold,
+                'sell', sell, 'strong_sell', strong_sell,
+                'target_price', target_price, 'close', close,
+                'target_vs_close_pct',
+                    CASE WHEN close > 0 AND target_price IS NOT NULL
+                         THEN round((target_price/close - 1)*100.0, 2) END,
+                'ret_1d', ret_1d, 'ret_3m', ret_3m, 'ret_12m', ret_12m,
+                'bucketing_note', 'Buy/Hold/Sell reflect analyst consensus, not the strategies that surfaced the name. Unrated names default to Hold.')
+        FROM ranked
+        WHERE bucket_rank <= (cfg('top_n') * 2)::int;
+    END IF;
+
+    -- ================= ssg_picks =================
+    -- The Stock Selection Guide names, bucketed Buy/Hold/Sell. Buy is the
+    -- screener's stricter is_buy verdict (buy zone AND >=3:1 up/down AND total
+    -- return clears the size hurdle); Sell is the price sell zone; everything
+    -- else quality-passed -- including buy-zone near-misses -- is Hold. verdict
+    -- lives in facts so the renderer splits the one section into three columns.
+    SELECT max(issue_date) INTO v_ssg_date
+    FROM ssg_results WHERE issue_date <= p_issue_date;
+
+    IF v_ssg_date IS NULL THEN
+        INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+        VALUES (p_issue_date, 'ssg_picks', 1, NULL,
+            'No SSG screen available to classify: ssg_screener.py has not persisted results on or before this issue date.',
+            jsonb_build_object('status', 'no_run', 'ssg_as_of', NULL));
+    ELSE
+        WITH picks AS (
+            SELECT g.*,
+                CASE WHEN g.is_buy            THEN 'buy'
+                     WHEN g.zone = 'SELL'     THEN 'sell'
+                     ELSE 'hold' END AS verdict
+            FROM ssg_results g
+            WHERE g.issue_date = v_ssg_date
+              AND g.quality_pass
+        ),
+        ranked AS (
+            SELECT *,
+                CASE verdict WHEN 'buy' THEN 1 WHEN 'hold' THEN 2 ELSE 3 END AS vpri,
+                row_number() OVER (
+                    PARTITION BY verdict
+                    ORDER BY total_return DESC NULLS LAST, ticker
+                ) AS bucket_rank
+            FROM picks
+        )
+        INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+        SELECT p_issue_date, 'ssg_picks',
+            row_number() OVER (ORDER BY vpri, total_return DESC NULLS LAST, ticker),
+            ticker,
+            CASE verdict
+              WHEN 'buy' THEN
+                format('%s (%s): SSG Buy -- %s up/down, %s%% projected total return; buy below %s (now %s).',
+                       COALESCE(name, ticker), ticker,
+                       COALESCE(to_char(updown_ratio, 'FM990.0') || ':1', 'n/a'),
+                       to_char(COALESCE(total_return, 0) * 100.0, 'FM990.0'),
+                       to_char(buy_below, 'FM999990.00'), to_char(current_price, 'FM999990.00'))
+              WHEN 'sell' THEN
+                format('%s (%s): SSG Sell -- price in the sell zone (above %s; now %s).',
+                       COALESCE(name, ticker), ticker,
+                       to_char(sell_above, 'FM999990.00'), to_char(current_price, 'FM999990.00'))
+              ELSE
+                format('%s (%s): SSG Hold -- quality-growth name in the %s zone; %s%% projected total return.',
+                       COALESCE(name, ticker), ticker, lower(COALESCE(zone, 'unpriced')),
+                       to_char(COALESCE(total_return, 0) * 100.0, 'FM990.0'))
+            END,
+            jsonb_build_object(
+                'ticker', ticker, 'name', name, 'sector', sector,
+                'verdict', verdict, 'zone', zone, 'is_buy', is_buy,
+                'quality_pass', quality_pass, 'market_cap', market_cap,
+                'ssg_as_of', v_ssg_date, 'ssg_lag_days', (p_issue_date - v_ssg_date),
+                'current_price', current_price, 'buy_below', buy_below, 'sell_above', sell_above,
+                'updown_ratio', updown_ratio, 'total_return', total_return,
+                'price_appreciation_cagr', price_appreciation_cagr, 'avg_yield', avg_yield,
+                'forecast_high_price', forecast_high_price, 'forecast_low_price', forecast_low_price,
+                'projected_eps_5yr', projected_eps_5yr, 'high_pe', high_pe, 'low_pe', low_pe, 'roe', roe,
+                'reasons', to_jsonb(reasons),
+                'return_note', 'total_return and CAGR are fractions (0.15 = 15%). up/down is a ratio.',
+                'bucketing_note', 'Buy = SSG is_buy (buy zone, >=3:1 up/down, return over size hurdle). Sell = price sell zone. Hold = other quality-passed names, including buy-zone near-misses.')
+        FROM ranked
+        WHERE bucket_rank <= (cfg('top_n') * 2)::int;
+    END IF;
+
+    -- ================= news_recap =================
+    -- The day's financial-news recap. Most recent first, one row per distinct
+    -- headline, tone bucketed from the stored polarity so the LLM narrates a
+    -- label rather than re-deriving one.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'news_recap',
+        row_number() OVER (ORDER BY r.published_at DESC), r.ticker,
+        r.title,
+        jsonb_build_object(
+            'title', r.title, 'ticker', r.ticker, 'symbols', r.symbols,
+            'tags', r.tags, 'published_at', r.published_at, 'link', r.link,
+            'sentiment_polarity', r.sentiment_polarity,
+            'tone', CASE WHEN r.sentiment_polarity >=  0.15 THEN 'positive'
+                         WHEN r.sentiment_polarity <= -0.15 THEN 'negative'
+                         ELSE 'neutral' END)
+    FROM (
+        SELECT DISTINCT ON (n.title)
+               n.title, n.ticker, n.symbols, n.tags, n.published_at, n.link,
+               n.sentiment_polarity
+        FROM news n
+        WHERE n.published_at >= (p_issue_date::timestamptz - interval '36 hours')
+          AND n.title IS NOT NULL
+        ORDER BY n.title, n.published_at DESC
+    ) r
+    ORDER BY r.published_at DESC
+    LIMIT (cfg('top_n') * 2)::int;
+
+    -- ================= movers_advancing / movers_declining =================
+    -- Top gainers and losers in the liquid universe (price_perf already excludes
+    -- ETFs and non-holdings names). The min_price / min_avg_vol_20d floors keep
+    -- this out of microcap-noise territory -- see the notes on those config keys.
+    -- Ranked by 1-day return, volume breaking ties so the "most active" of two
+    -- equal movers sorts first.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'movers_advancing',
+        row_number() OVER (ORDER BY pp.ret_1d DESC, pp.volume DESC),
+        pp.ticker,
+        format('%s (%s) +%s%% on %s shares.',
+               coalesce(f.name, pp.ticker), pp.ticker, pp.ret_1d,
+               to_char(pp.volume, 'FM999,999,999,999')),
+        jsonb_build_object(
+            'ticker', pp.ticker, 'name', f.name, 'sector', f.sector,
+            'as_of', pp.as_of, 'close', pp.close, 'ret_1d', pp.ret_1d,
+            'ret_5d', pp.ret_5d, 'volume', pp.volume, 'avg_vol_20d', pp.avg_vol_20d,
+            'vol_ratio', pp.vol_ratio, 'dollar_volume', round(pp.close * pp.volume))
+    FROM price_perf pp
+    LEFT JOIN fundamentals f ON f.ticker = pp.ticker
+    WHERE pp.ret_1d IS NOT NULL AND pp.ret_1d > 0
+      AND pp.close       >= cfg('min_price')
+      AND pp.avg_vol_20d >= cfg('min_avg_vol_20d')
+      AND coalesce(f.is_delisted, false) = false
+    ORDER BY pp.ret_1d DESC, pp.volume DESC
+    LIMIT cfg('top_n_movers')::int;
+
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'movers_declining',
+        row_number() OVER (ORDER BY pp.ret_1d ASC, pp.volume DESC),
+        pp.ticker,
+        format('%s (%s) %s%% on %s shares.',
+               coalesce(f.name, pp.ticker), pp.ticker, pp.ret_1d,
+               to_char(pp.volume, 'FM999,999,999,999')),
+        jsonb_build_object(
+            'ticker', pp.ticker, 'name', f.name, 'sector', f.sector,
+            'as_of', pp.as_of, 'close', pp.close, 'ret_1d', pp.ret_1d,
+            'ret_5d', pp.ret_5d, 'volume', pp.volume, 'avg_vol_20d', pp.avg_vol_20d,
+            'vol_ratio', pp.vol_ratio, 'dollar_volume', round(pp.close * pp.volume))
+    FROM price_perf pp
+    LEFT JOIN fundamentals f ON f.ticker = pp.ticker
+    WHERE pp.ret_1d IS NOT NULL AND pp.ret_1d < 0
+      AND pp.close       >= cfg('min_price')
+      AND pp.avg_vol_20d >= cfg('min_avg_vol_20d')
+      AND coalesce(f.is_delisted, false) = false
+    ORDER BY pp.ret_1d ASC, pp.volume DESC
+    LIMIT cfg('top_n_movers')::int;
+
+    -- ================= sector_heatmap =================
+    -- One row per sector: the cap-weighted 1-day return across that sector's
+    -- constituents in the same liquid universe as the movers, plus breadth
+    -- (advancers / decliners). Cap-weighting mirrors how a real sector tile is
+    -- built and keeps a single large name from being drowned out by small ones.
+    -- Ranked strongest-to-weakest so the renderer lays the grid out in order.
+    INSERT INTO newsletter_findings (issue_date, section, rank, ticker, headline, facts)
+    SELECT p_issue_date, 'sector_heatmap',
+        row_number() OVER (ORDER BY s.wret DESC NULLS LAST),
+        NULL,
+        format('%s: %s%% cap-weighted across %s names (%s up / %s down).',
+               s.sector,
+               CASE WHEN s.wret >= 0 THEN '+' || s.wret ELSE s.wret::text END,
+               s.n, s.n_adv, s.n_dec),
+        jsonb_build_object(
+            'sector', s.sector, 'weighted_ret_1d', s.wret, 'avg_ret_1d', s.aret,
+            'n', s.n, 'n_advancing', s.n_adv, 'n_declining', s.n_dec,
+            'total_market_cap', s.mktcap)
+    FROM (
+        SELECT f.sector,
+               round(sum(pp.ret_1d * f.market_cap) / nullif(sum(f.market_cap), 0), 2) AS wret,
+               round(avg(pp.ret_1d), 2) AS aret,
+               count(*) AS n,
+               count(*) FILTER (WHERE pp.ret_1d > 0) AS n_adv,
+               count(*) FILTER (WHERE pp.ret_1d < 0) AS n_dec,
+               sum(f.market_cap) AS mktcap
+        FROM price_perf pp
+        JOIN fundamentals f ON f.ticker = pp.ticker
+        WHERE pp.ret_1d IS NOT NULL
+          AND f.sector IS NOT NULL
+          AND f.market_cap IS NOT NULL AND f.market_cap > 0
+          AND pp.close       >= cfg('min_price')
+          AND pp.avg_vol_20d >= cfg('min_avg_vol_20d')
+          AND coalesce(f.is_delisted, false) = false
+        GROUP BY f.sector
+    ) s;
 
     SELECT count(*) INTO v_count FROM newsletter_findings WHERE issue_date = p_issue_date;
     RETURN v_count;
@@ -1342,6 +1728,19 @@ ALTER SEQUENCE public.news_id_seq OWNED BY public.news.id;
 
 
 --
+-- Name: newsletter_benchmarks; Type: TABLE; Schema: public; Owner: jon
+--
+
+CREATE TABLE public.newsletter_benchmarks (
+    symbol text NOT NULL,
+    display_name text NOT NULL,
+    sort_order integer DEFAULT 100 NOT NULL
+);
+
+
+ALTER TABLE public.newsletter_benchmarks OWNER TO jon;
+
+--
 -- Name: newsletter_config; Type: TABLE; Schema: public; Owner: jon
 --
 
@@ -1715,6 +2114,56 @@ CREATE TABLE public.splits_calendar (
 
 
 ALTER TABLE public.splits_calendar OWNER TO postgres;
+
+--
+-- Name: ssg_results; Type: TABLE; Schema: public; Owner: jon
+--
+
+CREATE TABLE public.ssg_results (
+    issue_date date NOT NULL,
+    ticker text NOT NULL,
+    name text,
+    sector text,
+    market_cap numeric,
+    current_price numeric,
+    zone text,
+    is_buy boolean DEFAULT false NOT NULL,
+    quality_pass boolean DEFAULT false NOT NULL,
+    buy_below numeric,
+    sell_above numeric,
+    updown_ratio numeric,
+    total_return numeric,
+    price_appreciation_cagr numeric,
+    avg_yield numeric,
+    forecast_high_price numeric,
+    forecast_low_price numeric,
+    projected_eps_5yr numeric,
+    high_pe numeric,
+    low_pe numeric,
+    roe numeric,
+    reasons text[],
+    run_ts timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.ssg_results OWNER TO jon;
+
+--
+-- Name: strategy_signals; Type: TABLE; Schema: public; Owner: jon
+--
+
+CREATE TABLE public.strategy_signals (
+    issue_date date NOT NULL,
+    ticker text NOT NULL,
+    signals text[] NOT NULL,
+    signal_count integer NOT NULL,
+    is_top_conviction boolean DEFAULT false NOT NULL,
+    conviction_rank integer,
+    run_ts timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.strategy_signals OWNER TO jon;
 
 --
 -- Name: symbol_change_history; Type: TABLE; Schema: public; Owner: postgres
@@ -2114,6 +2563,14 @@ ALTER TABLE ONLY public.news
 
 
 --
+-- Name: newsletter_benchmarks newsletter_benchmarks_pkey; Type: CONSTRAINT; Schema: public; Owner: jon
+--
+
+ALTER TABLE ONLY public.newsletter_benchmarks
+    ADD CONSTRAINT newsletter_benchmarks_pkey PRIMARY KEY (symbol);
+
+
+--
 -- Name: newsletter_config newsletter_config_pkey; Type: CONSTRAINT; Schema: public; Owner: jon
 --
 
@@ -2207,6 +2664,22 @@ ALTER TABLE ONLY public.splits_calendar
 
 ALTER TABLE ONLY public.splits
     ADD CONSTRAINT splits_pkey PRIMARY KEY (ticker, date);
+
+
+--
+-- Name: ssg_results ssg_results_pkey; Type: CONSTRAINT; Schema: public; Owner: jon
+--
+
+ALTER TABLE ONLY public.ssg_results
+    ADD CONSTRAINT ssg_results_pkey PRIMARY KEY (issue_date, ticker);
+
+
+--
+-- Name: strategy_signals strategy_signals_pkey; Type: CONSTRAINT; Schema: public; Owner: jon
+--
+
+ALTER TABLE ONLY public.strategy_signals
+    ADD CONSTRAINT strategy_signals_pkey PRIMARY KEY (issue_date, ticker);
 
 
 --
@@ -3047,6 +3520,13 @@ GRANT SELECT ON TABLE public.news TO ai_agent;
 
 
 --
+-- Name: TABLE newsletter_benchmarks; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.newsletter_benchmarks TO ai_agent;
+
+
+--
 -- Name: TABLE newsletter_config; Type: ACL; Schema: public; Owner: jon
 --
 
@@ -3148,6 +3628,20 @@ GRANT SELECT ON TABLE public.splits_calendar TO ai_agent;
 
 
 --
+-- Name: TABLE ssg_results; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.ssg_results TO ai_agent;
+
+
+--
+-- Name: TABLE strategy_signals; Type: ACL; Schema: public; Owner: jon
+--
+
+GRANT SELECT ON TABLE public.strategy_signals TO ai_agent;
+
+
+--
 -- Name: TABLE symbol_change_history; Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -3205,5 +3699,5 @@ ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABL
 -- PostgreSQL database dump complete
 --
 
-\unrestrict KtC0bvjyrNf5ahEbmRdKuSQ7Uc3RKOxaxO0I0ZiV5Bnx8jnqdIxZETV9WsL4SHs
+\unrestrict AtqcZqfohcoKIwgfcGcDpdwJG4H8oZNaXTBXg67TG042vA4suh63vrfcdY4kC6E
 

@@ -18,3 +18,9 @@ findings/
 *.log
 *.csv
 old_*
+
+# patches
+*.patch
+
+# sample output .html files
+*.html

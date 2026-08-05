@@ -23,9 +23,12 @@ Environment=PG_USER=ai_agent
 
 ExecStart=/home/jon/eodhd/venv/bin/python -m explorer.runner
 
-# Generate + email the morning report right after exploration finishes.
-# Drop this line if morning_report.bash / a separate unit already does it.
-ExecStartPost=/home/jon/eodhd/venv/bin/python -m explorer.morning_report
+# Publish + email the daily newsletter right after exploration finishes.
+# build_newsletter() WRITES newsletter_findings, so this step must run as
+# the writer role -- override the unit's read-only PG_USER=ai_agent back to
+# the writer identity for this step only. PG_PASSWORD still comes from .env,
+# and reads keep using PG_RO_USER=ai_agent. Exploration above stays read-only.
+ExecStartPost=/usr/bin/env PG_USER=jon /home/jon/eodhd/venv/bin/python -m explorer.newsletter
 
 Nice=10
 TimeoutStartSec=3600
